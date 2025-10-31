@@ -25,13 +25,13 @@ use embassy_executor::Spawner;
 use embassy_stm32::{
     exti::ExtiInput,
     gpio::{Input, Level, Output, Pull, Speed},
-    spi::{Config as SpiConfig, Spi, Mode as SpiMode, Phase, Polarity},
+    spi::{Config as SpiConfig, Mode as SpiMode, Phase, Polarity, Spi},
     time::Hertz,
 };
 use embassy_time::{Duration, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 
-use dw1000_rs::{DW1000, DW1000Ranging, RangingEvent};
+use dw1000_rs::{DW1000Ranging, RangingEvent, DW1000};
 
 // connection pins
 const PIN_RST: u8 = 9;
@@ -56,17 +56,18 @@ async fn main(_spawner: Spawner) {
     };
 
     let spi = Spi::new(
-        p.SPI1,
-        p.PA5, // SCK
-        p.PA7, // MOSI
-        p.PA6, // MISO
+        p.SPI1, p.PA5,      // SCK
+        p.PA7,      // MOSI
+        p.PA6,      // MISO
         p.DMA1_CH3, // TX DMA
         p.DMA1_CH2, // RX DMA
         spi_config,
     );
 
     let cs = Output::new(p.PA4, Level::High, Speed::VeryHigh);
-    let spi_device = ExclusiveDevice::new(spi, cs, embassy_time::Delay).ok().unwrap();
+    let spi_device = ExclusiveDevice::new(spi, cs, embassy_time::Delay)
+        .ok()
+        .unwrap();
 
     let mut rst = Output::new(p.PA9, Level::High, Speed::VeryHigh);
     let _irq = ExtiInput::new(Input::new(p.PA2, Pull::Down), p.EXTI2);
@@ -98,30 +99,25 @@ async fn main(_spawner: Spawner) {
 
     // Main loop
     loop {
-        ranging.loop_step(&mut dw1000, |event| {
-            match event {
-                RangingEvent::NewRange(device) => {
-                    defmt::info!(
-                        "from: {:04X} Range: {} m RX power: {} dBm",
-                        device.get_short_address(),
-                        device.get_range(),
-                        device.get_rx_power()
-                    );
-                }
-                RangingEvent::BlinkDevice(device) => {
-                    defmt::info!(
-                        "blink; 1 device added ! -> short: {:04X}",
-                        device.get_short_address()
-                    );
-                }
-                RangingEvent::InactiveDevice(device) => {
-                    defmt::info!(
-                        "delete inactive device: {:04X}",
-                        device.get_short_address()
-                    );
-                }
-                _ => {}
+        ranging.loop_step(&mut dw1000, |event| match event {
+            RangingEvent::NewRange(device) => {
+                defmt::info!(
+                    "from: {:04X} Range: {} m RX power: {} dBm",
+                    device.get_short_address(),
+                    device.get_range(),
+                    device.get_rx_power()
+                );
             }
+            RangingEvent::BlinkDevice(device) => {
+                defmt::info!(
+                    "blink; 1 device added ! -> short: {:04X}",
+                    device.get_short_address()
+                );
+            }
+            RangingEvent::InactiveDevice(device) => {
+                defmt::info!("delete inactive device: {:04X}", device.get_short_address());
+            }
+            _ => {}
         });
 
         Timer::after(Duration::from_micros(100)).await;

@@ -4,7 +4,7 @@
 //! DW1000 UWB transceiver. The DW1000 uses 40-bit timestamps where each bit
 //! represents approximately 15.65 picoseconds.
 
-use core::ops::{Add, AddAssign, Sub, SubAssign, Mul, MulAssign, Div, DivAssign};
+use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign};
 
 #[cfg(feature = "defmt")]
 use defmt::Format;
@@ -68,7 +68,7 @@ impl DW1000Time {
     /// # Arguments
     /// * `timestamp` - Raw timestamp where 1 unit ≈ 15.65ps
     #[inline]
-    pub const fn from_timestamp(timestamp: i64) -> Self {
+    pub fn from_timestamp(timestamp: i64) -> Self {
         let mut time = Self::new();
         time.set_timestamp(timestamp);
         time

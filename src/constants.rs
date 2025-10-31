@@ -502,4 +502,3 @@ pub const MSGP8: u8 = 22;
 pub const GPIO_MODE: u8 = 0;
 /// LED mode value
 pub const LED_MODE: u8 = 1;
-

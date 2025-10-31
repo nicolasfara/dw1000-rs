@@ -152,24 +152,36 @@ impl OperatingMode {
     /// Returns the data rate, pulse frequency, and preamble length for this mode
     pub const fn config(&self) -> (DataRate, PulseFrequency, PreambleLength) {
         match self {
-            OperatingMode::LongDataRangeLowPower => {
-                (DataRate::Kbps110, PulseFrequency::Mhz16, PreambleLength::Symbols2048)
-            }
-            OperatingMode::ShortDataFastLowPower => {
-                (DataRate::Mbps6800, PulseFrequency::Mhz16, PreambleLength::Symbols128)
-            }
-            OperatingMode::LongDataFastLowPower => {
-                (DataRate::Mbps6800, PulseFrequency::Mhz16, PreambleLength::Symbols1024)
-            }
-            OperatingMode::ShortDataFastAccuracy => {
-                (DataRate::Mbps6800, PulseFrequency::Mhz64, PreambleLength::Symbols128)
-            }
-            OperatingMode::LongDataFastAccuracy => {
-                (DataRate::Mbps6800, PulseFrequency::Mhz64, PreambleLength::Symbols1024)
-            }
-            OperatingMode::LongDataRangeAccuracy => {
-                (DataRate::Kbps110, PulseFrequency::Mhz64, PreambleLength::Symbols2048)
-            }
+            OperatingMode::LongDataRangeLowPower => (
+                DataRate::Kbps110,
+                PulseFrequency::Mhz16,
+                PreambleLength::Symbols2048,
+            ),
+            OperatingMode::ShortDataFastLowPower => (
+                DataRate::Mbps6800,
+                PulseFrequency::Mhz16,
+                PreambleLength::Symbols128,
+            ),
+            OperatingMode::LongDataFastLowPower => (
+                DataRate::Mbps6800,
+                PulseFrequency::Mhz16,
+                PreambleLength::Symbols1024,
+            ),
+            OperatingMode::ShortDataFastAccuracy => (
+                DataRate::Mbps6800,
+                PulseFrequency::Mhz64,
+                PreambleLength::Symbols128,
+            ),
+            OperatingMode::LongDataFastAccuracy => (
+                DataRate::Mbps6800,
+                PulseFrequency::Mhz64,
+                PreambleLength::Symbols1024,
+            ),
+            OperatingMode::LongDataRangeAccuracy => (
+                DataRate::Kbps110,
+                PulseFrequency::Mhz64,
+                PreambleLength::Symbols2048,
+            ),
         }
     }
 }

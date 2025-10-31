@@ -10,18 +10,18 @@
 #[cfg(feature = "defmt")]
 use defmt;
 
-pub mod time;
-pub mod constants;
 pub mod config;
+pub mod constants;
 mod device;
+pub mod time;
 // pub mod hl;
 // pub mod device;
 // pub mod mac;
 // pub mod ranging;
 
-pub use time::DW1000Time;
-pub use constants::DeviceMode;
 pub use config::*;
+pub use constants::DeviceMode;
+pub use time::DW1000Time;
 // pub use hl::DW1000;
 // pub use device::DW1000Device;
 // pub use mac::DW1000Mac;

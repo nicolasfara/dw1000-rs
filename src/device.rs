@@ -13,29 +13,29 @@ pub struct DW1000Device<R: RngCore> {
     range: i16,
     rx_power: i16,
     fp_power: i16,
-    quality: i16
+    quality: i16,
 }
 
-impl <R: RngCore> DW1000Device<R> {
-
-    pub fn new(rng: &mut R) -> DW1000Device<R> {
-        DW1000Device {
-            randomizer: rng.clone(),
+impl<R: RngCore> DW1000Device<R> {
+    pub fn new(mut rng: R) -> DW1000Device<R> {
+        let random = Self::random_short_address(&mut rng);
+        Self {
+            randomizer: rng,
             address: [0u8; 8],
-            short_address: Self::random_short_address(rng),
+            short_address: random,
             activity: 0,
             reply_delay_time_us: 0,
             index: -1,
             range: -1,
             rx_power: -1,
             fp_power: -1,
-            quality: -1
+            quality: -1,
         }
     }
 
-    pub fn from_addresses(rng: &mut R, address: [u8; 8], short_address: [u8; 2]) -> DW1000Device<R> {
-        DW1000Device {
-            randomizer: rng.clone(),
+    pub fn from_addresses(rng: R, address: [u8; 8], short_address: [u8; 2]) -> DW1000Device<R> {
+        Self {
+            randomizer: rng,
             address,
             short_address,
             activity: 0,
@@ -44,7 +44,7 @@ impl <R: RngCore> DW1000Device<R> {
             range: -1,
             rx_power: -1,
             fp_power: -1,
-            quality: -1
+            quality: -1,
         }
     }
 
@@ -84,9 +84,25 @@ impl <R: RngCore> DW1000Device<R> {
         self.short_address
     }
 
-    fn random_short_address(&mut self) -> [u8; 2] {
+    pub fn get_range(&self) -> f64 {
+        self.range as f64 / 100f64
+    }
+
+    pub fn get_rx_power(&self) -> f64 {
+        self.rx_power as f64 / 100f64
+    }
+
+    pub fn get_fp_power(&self) -> f64 {
+        self.fp_power as f64 / 100f64
+    }
+
+    pub fn get_quality(&self) -> f64 {
+        self.quality as f64 / 100f64
+    }
+
+    fn random_short_address(random: &mut R) -> [u8; 2] {
         let mut addr = [0u8; 2];
-        self.randomizer.fill_bytes(&mut addr);
+        random.fill_bytes(&mut addr);
         addr
     }
 }
