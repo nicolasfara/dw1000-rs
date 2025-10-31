@@ -14,6 +14,7 @@ pub mod config;
 pub mod constants;
 mod device;
 pub mod time;
+mod dw1000;
 // pub mod hl;
 // pub mod device;
 // pub mod mac;

@@ -10,10 +10,10 @@ keywords = ["embedded", "uwb", "dw1000", "driver", "no-std"]
 categories = ["embedded", "hardware-support", "no-std"]
 
 [dependencies]
-embedded-hal = "1.0"
+embedded-hal = "1.0.0"
 defmt = { version = "0.3", optional = true }
 libm = "0.2"
-heapless = "0.8"
+heapless = "0.9.1"
 rand_core = "0.9.3"
 
 [dev-dependencies]
