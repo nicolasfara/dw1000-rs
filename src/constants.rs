@@ -502,3 +502,14 @@ pub const MSGP8: u8 = 22;
 pub const GPIO_MODE: u8 = 0;
 /// LED mode value
 pub const LED_MODE: u8 = 1;
+
+pub const FC_1: u8 = 0x41;
+pub const FC_1_BLINK: u8 = 0xC5;
+pub const FC_2: u8 = 0x8C;
+pub const FC_2_SHORT: u8 = 0x88;
+
+pub const PAN_ID_1: u8 = 0xCA;
+pub const PAN_ID_2: u8 = 0xDE;
+
+pub const SHORT_MAC_LEN: u8 = 9;
+pub const LONG_MAC_LEN: u8 = 15;

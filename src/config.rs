@@ -197,6 +197,21 @@ pub enum ClockMode {
     /// PLL clock
     Pll = 0x02,
 }
+impl ClockMode {
+    /// Converts a u8 to ClockMode, defaulting to Auto for invalid values
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0x01 => ClockMode::Xti,
+            0x02 => ClockMode::Pll,
+            _ => ClockMode::Auto,
+        }
+    }
+    
+    /// Converts ClockMode to u8
+    pub fn to_u8(&self) -> u8 {
+        *self as u8
+    }
+}
 
 /// Range bias correction tables for different configurations
 pub struct RangeBias;
