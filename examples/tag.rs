@@ -34,7 +34,7 @@ use embedded_hal_bus::spi::ExclusiveDevice;
 use {defmt_rtt as _, panic_halt as _};
 
 use dw1000_rs::dw1000::Dw1000;
-use dw1000_rs::ranging::Dw1000Ranging;
+use dw1000_rs::ranging::{DeviceType, Dw1000Ranging, RangingEvent};
 
 // Tag configuration
 const TAG_ADDRESS: &str = "7D:00:22:EA:82:60:3B:9C";
@@ -77,11 +77,38 @@ async fn main(_spawner: Spawner) {
 
     // Note: ExclusiveDevice already manages CS, so we pass a dummy Output pin
     let mut dw1000 = Dw1000::new(spi_device, _irq, rst, embassy_time::Delay);
-    let mut ranging = Dw1000Ranging::new(&mut dw1000);
+    let mut ranging = Dw1000Ranging::new(&mut dw1000, DeviceType::Tag);
+    ranging.init_communication().expect("DW1000 init failed");
 
     defmt::info!("DW1000 initialized for Tag at address {}", TAG_ADDRESS);
 
     loop {
-        Timer::after(Duration::from_millis(100)).await;
+        match ranging.round().expect("ranging failed") {
+            RangingEvent::None => { }
+            RangingEvent::BlinkReceived { .. } => {
+                defmt::info!("Blink message received from anchor");
+            }
+            RangingEvent::NewDevice { .. } => {
+                defmt::info!("New device discovered");
+            }
+            RangingEvent::InactiveDevice { .. } => {
+                defmt::info!("Device became inactive");
+            }
+            RangingEvent::NewRange { .. } => {
+                defmt::info!("New range measurement received");
+            }
+            RangingEvent::RangingInitReceived { .. } => {
+                defmt::info!("Ranging init message received");
+            }
+            RangingEvent::DeviceNotFound { .. } => {
+                defmt::warn!("Device not found for ranging");
+            }
+            RangingEvent::UnexpectedMessage => {
+                defmt::warn!("DW1000 unexpected message");
+            }
+            RangingEvent::ProtocolFailed => {
+                defmt::warn!("DW1000 protocol failed");
+            }
+        }
     }
 }
