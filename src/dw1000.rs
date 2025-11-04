@@ -1,9 +1,9 @@
-use core::ptr::write_bytes;
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::{Operation, SpiDevice};
 use crate::{ClockMode, DeviceMode};
-use crate::constants::{DIS_DRXB_BIT, HIRQ_POL_BIT, LEN_OTP_ADDR, LEN_OTP_CTRL, LEN_OTP_RDAT, LEN_PANADR, LEN_PMSC_CTRL0, LEN_SYS_CFG, LEN_SYS_CTRL, LEN_SYS_MASK, NO_SUB, OTP_ADDR_SUB, OTP_CTRL_SUB, OTP_IF, OTP_RDAT_SUB, PANADR, PMSC, PMSC_CTRL0_SUB, SYS_CFG, SYS_CTRL, SYS_MASK, TRXOFF_BIT};
+use crate::config::{DataRate, PacSize, PreambleLength, PulseFrequency};
+use crate::constants::{CHAN_CTRL, DIS_DRXB_BIT, DWSFD_BIT, HIRQ_POL_BIT, LDE_IF, LDE_RXANTD_SUB, LEN_CHAN_CTRL, LEN_OTP_ADDR, LEN_OTP_CTRL, LEN_OTP_RDAT, LEN_PANADR, LEN_PMSC_CTRL0, LEN_SYS_CFG, LEN_SYS_CTRL, LEN_SYS_MASK, LEN_TX_FCTRL, NO_SUB, OTP_ADDR_SUB, OTP_CTRL_SUB, OTP_IF, OTP_RDAT_SUB, PANADR, PMSC, PMSC_CTRL0_SUB, RNSSFD_BIT, RXM110K_BIT, SFD_LENGTH_SUB, SYS_CFG, SYS_CTRL, SYS_MASK, TNSSFD_BIT, TRXOFF_BIT, TX_ANTD, TX_FCTRL, USR_SFD};
 
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -22,8 +22,16 @@ pub struct Dw1000<SPI, IRQ, RST, DELAY> {
     sysctrl: [u8; LEN_SYS_CTRL],
     syscfg: [u8; LEN_SYS_CFG],
     sysmask: [u8; LEN_SYS_MASK],
+    txfctrl: [u8; LEN_TX_FCTRL],
+    chanctrl: [u8; LEN_CHAN_CTRL],
     network_and_address: [u8; LEN_PANADR],
     device_mode: DeviceMode,
+    data_rate: DataRate,
+    pulse_frequency: PulseFrequency,
+    preamble_length: PreambleLength,
+    pac_size: PacSize,
+    antenna_delay: u16,
+    antenna_calibrated: bool,
     vmeas3v3: u8,
     tmeas23c: u8,
 }
@@ -50,8 +58,16 @@ where
             sysctrl: [0u8; LEN_SYS_CTRL],
             syscfg: [0u8; LEN_SYS_CFG],
             sysmask: [0u8; LEN_SYS_MASK],
+            txfctrl: [0u8; LEN_TX_FCTRL],
+            chanctrl: [0u8; LEN_CHAN_CTRL],
             network_and_address: [0u8; LEN_PANADR],
             device_mode: DeviceMode::Idle,
+            data_rate: DataRate::Kbps110,
+            pulse_frequency: PulseFrequency::Mhz16,
+            preamble_length: PreambleLength::Symbols2048,
+            pac_size: PacSize::Symbols64,
+            antenna_delay: 0,
+            antenna_calibrated: false,
             vmeas3v3: 0,
             tmeas23c: 0,
         }
@@ -128,6 +144,156 @@ where
         self.device_mode = DeviceMode::Idle;
         let data = self.sysctrl.clone();
         self.write_bytes(SYS_CTRL, NO_SUB as u16, &data)
+    }
+
+    pub fn set_device_address(&mut self, value: u16) {
+        self.network_and_address[2] = (value & 0xFF) as u8;
+        self.network_and_address[3] = ((value >> 8) & 0xFF) as u8;
+    }
+
+    pub fn set_network_id(&mut self, value: u16) {
+        self.network_and_address[0] = (value & 0xFF) as u8;
+        self.network_and_address[1] = ((value >> 8) & 0xFF) as u8;
+    }
+
+    pub fn enable_mode(&mut self, mode: &[u8]) {
+
+    }
+
+    pub fn set_data_rate(&mut self, rate: DataRate) -> Result<(), Dw1000Error<SPI::Error>> {
+        let rate_value = rate as u8;
+        // Set the data rate in TX_FCTRL register (bits 5-6 of byte 1)
+        self.txfctrl[1] &= 0x83; // Clear bits 5-6
+        self.txfctrl[1] |= (rate_value << 5) & 0xFF;
+        // Special 110kbps flag in SYS_CFG
+        if rate == DataRate::Kbps110 {
+            Self::set_bit(&mut self.syscfg, RXM110K_BIT as u16, true);
+        } else {
+            Self::set_bit(&mut self.syscfg, RXM110K_BIT as u16, false);
+        }
+        // SFD mode and type configuration based on data rate
+        let sfd_length: u8 = match rate {
+            DataRate::Mbps6800 => {
+                // 6.8 Mbps: standard SFD
+                Self::set_bit(&mut self.chanctrl, DWSFD_BIT as u16, false);
+                Self::set_bit(&mut self.chanctrl, TNSSFD_BIT as u16, false);
+                Self::set_bit(&mut self.chanctrl, RNSSFD_BIT as u16, false);
+                0x08
+            }
+            DataRate::Kbps850 => {
+                // 850 kbps: non-standard SFD (Decawave proprietary)
+                Self::set_bit(&mut self.chanctrl, DWSFD_BIT as u16, true);
+                Self::set_bit(&mut self.chanctrl, TNSSFD_BIT as u16, true);
+                Self::set_bit(&mut self.chanctrl, RNSSFD_BIT as u16, true);
+                0x10
+            }
+            DataRate::Kbps110 => {
+                // 110 kbps: non-standard SFD (Decawave proprietary, RX only)
+                Self::set_bit(&mut self.chanctrl, DWSFD_BIT as u16, true);
+                Self::set_bit(&mut self.chanctrl, TNSSFD_BIT as u16, false);
+                Self::set_bit(&mut self.chanctrl, RNSSFD_BIT as u16, false);
+                0x40
+            }
+        };
+        // Write SFD length
+        self.write_bytes(USR_SFD, SFD_LENGTH_SUB as u16, &[sfd_length])?;
+
+        self.data_rate = rate;
+
+        Ok(())
+    }
+
+    pub fn set_pulse_frequency(&mut self, freq: PulseFrequency) {
+        let freq_value = freq as u8;
+
+        // Set pulse frequency in TX_FCTRL register (bits 0-1 of byte 2)
+        self.txfctrl[2] &= 0xFC; // Clear bits 0-1
+        self.txfctrl[2] |= freq_value & 0xFF;
+
+        // Set pulse frequency in CHAN_CTRL register (bits 2-3 of byte 2)
+        self.chanctrl[2] &= 0xF3; // Clear bits 2-3
+        self.chanctrl[2] |= (freq_value << 2) & 0xFF;
+
+        self.pulse_frequency = freq;
+    }
+
+    pub fn set_preamble_length(&mut self, prealen: PreambleLength) {
+        let prealen_value = prealen as u8;
+
+        // Set preamble length in TX_FCTRL register (bits 2-5 of byte 2)
+        self.txfctrl[2] &= 0xC3; // Clear bits 2-5
+        self.txfctrl[2] |= (prealen_value << 2) & 0xFF;
+
+        // Determine PAC size based on preamble length
+        // According to DW1000 User Manual Table 8
+        self.pac_size = match prealen {
+            PreambleLength::Symbols64 | PreambleLength::Symbols128 => PacSize::Symbols8,
+            PreambleLength::Symbols256 | PreambleLength::Symbols512 => PacSize::Symbols16,
+            PreambleLength::Symbols1024 => PacSize::Symbols32,
+            _ => PacSize::Symbols64, // 1536, 2048, 4096
+        };
+
+        self.preamble_length = prealen;
+    }
+
+    /// Commit all configuration changes to the DW1000 device
+    ///
+    /// This method writes all cached configuration registers back to the device
+    /// and performs device tuning according to the current configuration.
+    /// It also sets the antenna delay if not already calibrated.
+    pub fn commit_configuration(&mut self) -> Result<(), Dw1000Error<SPI::Error>> {
+        // Write network ID and device address
+        self.write_network_id_and_device_address()?;
+
+        // Write system configuration register
+        self.write_system_configuration_register()?;
+
+        // Write channel control register
+        self.write_channel_control_register()?;
+
+        // Write transmit frame control register
+        self.write_transmit_frame_control_register()?;
+
+        // Write system event mask register
+        self.write_system_event_mask_register()?;
+
+        // TODO: Implement tune() method for full device tuning
+        // tune()?;
+
+        // Set default antenna delay if not calibrated
+        if self.antenna_delay == 0 && !self.antenna_calibrated {
+            self.antenna_delay = 16384;
+            self.antenna_calibrated = true;
+        }
+
+        // Write antenna delay to both TX and RX registers
+        let antenna_delay_bytes = [
+            (self.antenna_delay & 0xFF) as u8,
+            ((self.antenna_delay >> 8) & 0xFF) as u8,
+        ];
+
+        self.write_bytes(TX_ANTD, NO_SUB as u16, &antenna_delay_bytes)?;
+        self.write_bytes(LDE_IF, LDE_RXANTD_SUB, &antenna_delay_bytes)?;
+
+        Ok(())
+    }
+
+    /// Write network ID and device address register to the device
+    fn write_network_id_and_device_address(&mut self) -> Result<(), Dw1000Error<SPI::Error>> {
+        let data = self.network_and_address;
+        self.write_bytes(PANADR, NO_SUB as u16, &data)
+    }
+
+    /// Write channel control register to the device
+    fn write_channel_control_register(&mut self) -> Result<(), Dw1000Error<SPI::Error>> {
+        let data = self.chanctrl;
+        self.write_bytes(CHAN_CTRL, NO_SUB as u16, &data)
+    }
+
+    /// Write transmit frame control register to the device
+    fn write_transmit_frame_control_register(&mut self) -> Result<(), Dw1000Error<SPI::Error>> {
+        let data = self.txfctrl;
+        self.write_bytes(TX_FCTRL, NO_SUB as u16, &data)
     }
 
     fn read_bytes_otp(&mut self, address: u16, data: &mut [u8]) -> Result<(), Dw1000Error<SPI::Error>> {

@@ -2,7 +2,7 @@ use embassy_time::Instant;
 use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
-use crate::constants::{FC_1, FC_1_BLINK, FC_2, FC_2_SHORT, LONG_MAC_LEN, SHORT_MAC_LEN};
+use crate::constants::{FC_1, FC_1_BLINK, FC_2, FC_2_SHORT, LONG_MAC_LEN, NO_SUB, PANADR, SHORT_MAC_LEN};
 use crate::dw1000::{Dw1000, Dw1000Error};
 use crate::time::DW1000Time;
 
@@ -188,6 +188,35 @@ where
         self.module.init()
     }
 
+    /// Configure the DW1000 network parameters
+    ///
+    /// This corresponds to DW1000Ranging::configureNetwork() in the C++ implementation.
+    /// It sets up device address, network ID, and operation mode (data rate, pulse frequency, preamble length).
+    ///
+    /// # Arguments
+    /// * `device_address` - The short device address (16-bit)
+    /// * `network_id` - The network/PAN ID (16-bit)
+    /// * `mode` - Configuration mode as [data_rate, pulse_frequency, preamble_length]
+    ///
+    /// # Example
+    /// ```ignore
+    /// // MODE_LONGDATA_RANGE_LOWPOWER equivalent: [TRX_RATE_110KBPS, TX_PULSE_FREQ_16MHZ, TX_PREAMBLE_LEN_2048]
+    /// ranging.configure_network(0x1234, 0xDECA, &[0x00, 0x01, 0x0C])?;
+    /// ```
+    pub fn configure_network(
+        &mut self,
+        device_address: u16,
+        network_id: u16,
+        mode: &[u8],
+    ) -> Result<(), Dw1000Error<SPI::Error>> {
+        // Put device in idle mode
+        self.module.idle()?;
+        self.module.set_device_address(device_address);
+        self.module.set_network_id(network_id);
+        self.module.enable_mode(mode);
+        self.module.commit_configuration()
+    }
+
     pub fn set_current_address(&mut self, address: [u8; 8], short_address: [u8; 2]) {
         self.current_address = address;
         self.current_short_address = short_address;
@@ -341,12 +370,12 @@ where
                     });
                 }
 
-                match self.device_type {
+                return match self.device_type {
                     DeviceType::Anchor => {
-                        return self.handle_anchor_message(message_type, device_index.unwrap());
+                        self.handle_anchor_message(message_type, device_index.unwrap())
                     }
                     DeviceType::Tag => {
-                        return self.handle_tag_message(message_type, device_index.unwrap());
+                        self.handle_tag_message(message_type, device_index.unwrap())
                     }
                 }
             }
