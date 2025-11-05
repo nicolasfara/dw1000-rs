@@ -19,8 +19,8 @@
 #![no_std]
 #![no_main]
 
-use {defmt_rtt as _, panic_halt as _};
-
+use cortex_m::asm::delay;
+use cortex_m::prelude::_embedded_hal_blocking_delay_DelayMs;
 use embassy_executor::Spawner;
 use embassy_stm32::{
     exti::ExtiInput,
@@ -28,14 +28,13 @@ use embassy_stm32::{
     spi::{Config as SpiConfig, Mode as SpiMode, Phase, Polarity, Spi},
     time::Hertz,
 };
+use embassy_stm32::spi::{BitOrder, MODE_0};
 use embassy_time::{Duration, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
+use {defmt_rtt as _, panic_halt as _};
 
-use dw1000_rs::{DW1000Ranging, RangingEvent, DW1000};
-
-// connection pins
-const PIN_RST: u8 = 9;
-const PIN_IRQ: u8 = 2;
+use dw1000_rs::dw1000::Dw1000;
+use dw1000_rs::ranging::{DeviceType, Dw1000Ranging, RangingEvent};
 
 // Anchor configuration
 const ANCHOR_ADDRESS: &str = "82:17:5B:D5:A9:9A:E2:9C";
@@ -49,11 +48,9 @@ async fn main(_spawner: Spawner) {
 
     // Configure SPI
     let mut spi_config = SpiConfig::default();
-    spi_config.frequency = Hertz(2_000_000);
-    spi_config.mode = SpiMode {
-        polarity: Polarity::IdleLow,
-        phase: Phase::CaptureOnFirstTransition,
-    };
+    spi_config.frequency = Hertz(5_000_000);
+    spi_config.mode = MODE_0;
+    spi_config.bit_order = BitOrder::MsbFirst;
 
     let spi = Spi::new(
         p.SPI1, p.PA5,      // SCK
@@ -69,7 +66,7 @@ async fn main(_spawner: Spawner) {
         .ok()
         .unwrap();
 
-    let mut rst = Output::new(p.PA9, Level::High, Speed::VeryHigh);
+    let mut rst = Output::new(p.PB12, Level::High, Speed::VeryHigh);
     let _irq = ExtiInput::new(Input::new(p.PA2, Pull::Down), p.EXTI2);
 
     // Initialize communication (Reset, CS, IRQ)
@@ -79,47 +76,40 @@ async fn main(_spawner: Spawner) {
     Timer::after(Duration::from_millis(100)).await;
 
     // Note: ExclusiveDevice already manages CS, so we pass a dummy Output pin
-    let dummy_cs = Output::new(p.PA3, Level::High, Speed::VeryHigh);
-    let mut dw1000 = DW1000::new(spi_device, dummy_cs);
-    let mut ranging = DW1000Ranging::new();
+    let mut dw1000 = Dw1000::new(spi_device, _irq, rst, embassy_time::Delay);
+    let mut ranging = Dw1000Ranging::new(&mut dw1000, DeviceType::Anchor);
+    ranging.init_communication().expect("DW1000 init failed");
+    ranging.configure_network(0x1234, 0xDECA, &[0x00, 0x01, 0x0C]).expect("FD");
 
-    // Initialize DW1000 communication
-    ranging.init_communication(&mut dw1000);
+    defmt::info!("DW1000 initialized for Anchor at address {}", ANCHOR_ADDRESS);
 
-    // Attach callbacks
-    // Note: In Rust we handle these inline in the loop rather than function pointers
-
-    // Enable the filter to smooth the distance (optional)
-    // ranging.use_range_filter(true);
-
-    // Start as anchor
-    ranging.start_as_anchor(&mut dw1000, ANCHOR_ADDRESS);
-
-    defmt::info!("Anchor started, waiting for tags...");
-
-    // Main loop
     loop {
-        ranging.loop_step(&mut dw1000, |event| match event {
-            RangingEvent::NewRange(device) => {
-                defmt::info!(
-                    "from: {:04X} Range: {} m RX power: {} dBm",
-                    device.get_short_address(),
-                    device.get_range(),
-                    device.get_rx_power()
-                );
+        match ranging.round().expect("ranging failed") {
+            RangingEvent::None => { }
+            RangingEvent::BlinkReceived { .. } => {
+                defmt::info!("Blink message received from tag");
             }
-            RangingEvent::BlinkDevice(device) => {
-                defmt::info!(
-                    "blink; 1 device added ! -> short: {:04X}",
-                    device.get_short_address()
-                );
+            RangingEvent::NewDevice { .. } => {
+                defmt::info!("New device discovered");
             }
-            RangingEvent::InactiveDevice(device) => {
-                defmt::info!("delete inactive device: {:04X}", device.get_short_address());
+            RangingEvent::InactiveDevice { .. } => {
+                defmt::info!("Device became inactive");
             }
-            _ => {}
-        });
-
-        Timer::after(Duration::from_micros(100)).await;
+            RangingEvent::NewRange { .. } => {
+                defmt::info!("New range measurement received");
+            }
+            RangingEvent::RangingInitReceived { .. } => {
+                defmt::info!("Ranging init message received");
+            }
+            RangingEvent::DeviceNotFound { .. } => {
+                defmt::warn!("Device not found for ranging");
+            }
+            RangingEvent::UnexpectedMessage => {
+                defmt::warn!("DW1000 unexpected message");
+            }
+            RangingEvent::ProtocolFailed => {
+                defmt::warn!("DW1000 protocol failed");
+            }
+        }
     }
 }

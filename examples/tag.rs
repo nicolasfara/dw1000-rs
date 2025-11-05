@@ -79,6 +79,7 @@ async fn main(_spawner: Spawner) {
     let mut dw1000 = Dw1000::new(spi_device, _irq, rst, embassy_time::Delay);
     let mut ranging = Dw1000Ranging::new(&mut dw1000, DeviceType::Tag);
     ranging.init_communication().expect("DW1000 init failed");
+    ranging.configure_network(0x1236, 0xDECA, &[0x00, 0x01, 0x0C]).expect("FD");
 
     defmt::info!("DW1000 initialized for Tag at address {}", TAG_ADDRESS);
 

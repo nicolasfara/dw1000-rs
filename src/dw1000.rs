@@ -3,7 +3,7 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::{Operation, SpiDevice};
 use crate::{ClockMode, DeviceMode};
 use crate::config::{DataRate, PacSize, PreambleLength, PulseFrequency};
-use crate::constants::{CHAN_CTRL, DIS_DRXB_BIT, DWSFD_BIT, HIRQ_POL_BIT, LDE_IF, LDE_RXANTD_SUB, LEN_CHAN_CTRL, LEN_OTP_ADDR, LEN_OTP_CTRL, LEN_OTP_RDAT, LEN_PANADR, LEN_PMSC_CTRL0, LEN_SYS_CFG, LEN_SYS_CTRL, LEN_SYS_MASK, LEN_TX_FCTRL, NO_SUB, OTP_ADDR_SUB, OTP_CTRL_SUB, OTP_IF, OTP_RDAT_SUB, PANADR, PMSC, PMSC_CTRL0_SUB, RNSSFD_BIT, RXM110K_BIT, SFD_LENGTH_SUB, SYS_CFG, SYS_CTRL, SYS_MASK, TNSSFD_BIT, TRXOFF_BIT, TX_ANTD, TX_FCTRL, USR_SFD};
+use crate::constants::{CHAN_CTRL, DIS_DRXB_BIT, DWSFD_BIT, EUI, HIRQ_POL_BIT, LDE_IF, LDE_RXANTD_SUB, LEN_CHAN_CTRL, LEN_EUI, LEN_OTP_ADDR, LEN_OTP_CTRL, LEN_OTP_RDAT, LEN_PANADR, LEN_PMSC_CTRL0, LEN_SYS_CFG, LEN_SYS_CTRL, LEN_SYS_MASK, LEN_TX_FCTRL, NO_SUB, OTP_ADDR_SUB, OTP_CTRL_SUB, OTP_IF, OTP_RDAT_SUB, PANADR, PMSC, PMSC_CTRL0_SUB, RNSSFD_BIT, RXM110K_BIT, SFD_LENGTH_SUB, SYS_CFG, SYS_CTRL, SYS_MASK, TNSSFD_BIT, TRXOFF_BIT, TX_ANTD, TX_FCTRL, USR_SFD};
 
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -144,6 +144,41 @@ where
         self.device_mode = DeviceMode::Idle;
         let data = self.sysctrl.clone();
         self.write_bytes(SYS_CTRL, NO_SUB as u16, &data)
+    }
+
+    pub fn set_eui(&mut self, eui: &str) -> Result<(), Dw1000Error<SPI::Error>> {
+        let eui_bytes = Self::convert_to_byte(eui);
+        self.set_eui_array(&eui_bytes)
+    }
+
+    /// Convert a hex string like "AA:FF:1C:..." to a byte array
+    fn convert_to_byte(value: &str) -> [u8; LEN_EUI] {
+        let mut eui_byte = [0u8; LEN_EUI];
+        // Fill the array from the string in the form of "AA:FF:1C:..."
+        for i in 0..LEN_EUI {
+            let high_nibble = Self::nibble_from_char(value.as_bytes()[i * 3] as char);
+            let low_nibble = Self::nibble_from_char(value.as_bytes()[i * 3 + 1] as char);
+            eui_byte[i] = (high_nibble << 4) + low_nibble;
+        }
+        eui_byte
+    }
+
+    /// Convert a hex character to its nibble value (0-15)
+    fn nibble_from_char(c: char) -> u8 {
+        match c {
+            '0'..='9' => c as u8 - b'0',
+            'a'..='f' => c as u8 - b'a' + 10,
+            'A'..='F' => c as u8 - b'A' + 10,
+            _ => 255,
+        }
+    }
+
+    fn set_eui_array(&mut self, eui: &[u8; 8]) -> Result<(), Dw1000Error<SPI::Error>> {
+        let mut reversed_eui = [0u8; 8];
+        for i in 0..8 {
+            reversed_eui[i] = eui[7 - i];
+        }
+        self.write_bytes(EUI, NO_SUB as u16, &reversed_eui)
     }
 
     pub fn set_device_address(&mut self, value: u16) {

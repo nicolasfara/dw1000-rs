@@ -217,6 +217,15 @@ where
         self.module.commit_configuration()
     }
 
+    pub fn start(&mut self, address: &str, mode: &[u8]) -> Result<(), Dw1000Error<SPI::Error>> {
+        self.module.set_eui(address)?;
+        self.configure_network(self.current_short_address[0] as u16 | ((self.current_short_address[1] as u16) << 8), 0xDECA, mode)
+    }
+
+    fn general_start(&mut self) -> Result<(), Dw1000Error<SPI::Error>> {
+        todo!()
+    }
+
     pub fn set_current_address(&mut self, address: [u8; 8], short_address: [u8; 2]) {
         self.current_address = address;
         self.current_short_address = short_address;
