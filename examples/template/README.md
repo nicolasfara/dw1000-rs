@@ -22,6 +22,13 @@ and keeps the main library crate board-neutral.
 - `PA9`: green status LED
 - `PA3`: battery sense input
 
+## Hardware Safety
+
+- Power the BU01 or other DW1000 module from its specified supply rail only. Do not assume the module is `5 V` tolerant just because the host board or USB source is.
+- Keep all DW1000-side GPIO and SPI signals at the module's logic voltage.
+- Drive `RSTn` as open-drain or otherwise only pull it low; do not actively drive it high from the MCU.
+- If the module becomes noticeably hot, disconnect power immediately and re-check `VCC`, `GND`, the exact module pinout, and whether any MCU pin is driving into a rail or a non-tolerant pin.
+
 ## Run
 
 1. Install the Cortex-M target: `rustup target add thumbv7em-none-eabihf`
@@ -53,6 +60,7 @@ Without that connection, attach can fail before the firmware starts.
 - The tag computes and logs the measured distance to the anchor when it receives a range report
 - The example exposes per-board antenna-delay calibration in
   `src/bin/anchor.rs` and `src/bin/tag.rs`
+- Fatal startup or runtime faults switch the board into a repeating fault pattern of three short orange LED blinks followed by a pause
 - The example uses a `3000 ms` peer inactivity timeout so occasional missed
   frames do not immediately drop a healthy anchor
 - The example now mirrors the STM6600 bootstrap and charger wiring used by the reference firmware

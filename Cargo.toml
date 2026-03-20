@@ -17,27 +17,17 @@ libm = "0.2"
 heapless = "0.9.1"
 rand_core = "0.9.3"
 
-[dev-dependencies]
-defmt = "0.3"
-defmt-rtt = "0.4"
-embassy-stm32 = { version = "0.1", features = ["stm32f103c8", "time-driver-any", "exti"] }
-embassy-executor = { version = "0.5", features = ["arch-cortex-m", "executor-thread", "integrated-timers", "defmt"] }
-embassy-embedded-hal = "0.1"
-embedded-hal-bus = "0.2"
-cortex-m = {  version = "0.7", features = ["critical-section-single-core"] }
-cortex-m-rt = "0.7"
-panic-halt = "0.2"
-
 [features]
 default = []
+legacy-examples = []
 
 [[example]]
 name = "anchor"
-required-features = []
+required-features = ["legacy-examples"]
 
 [[example]]
 name = "tag"
-required-features = []
+required-features = ["legacy-examples"]
 
 # Set the default for dependencies.
 [profile.dev.package."*"]
