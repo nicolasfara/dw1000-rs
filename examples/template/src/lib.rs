@@ -1,8 +1,7 @@
 #![no_std]
 
-// Placeholder timestamp source for defmt RTT logging. Replace this with a real
-// monotonic counter if you want meaningful timestamps in the example output.
-defmt::timestamp!("{=u32}", 0);
+// Shared RTT timestamp source fed by the STM32 platform timebase.
+defmt::timestamp!("{=u32}", crate::platform::defmt_timestamp_ms());
 
 pub mod common;
 pub mod compat;
