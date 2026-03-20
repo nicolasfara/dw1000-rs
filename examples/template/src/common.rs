@@ -9,6 +9,7 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::SpiDevice;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use stm32l4xx_hal as hal;
+use stm32l4xx_hal::gpio::PinState;
 use stm32l4xx_hal::hal::digital::v2::{InputPin as OldInputPin, OutputPin as OldOutputPin};
 use stm32l4xx_hal::prelude::*;
 
@@ -30,6 +31,10 @@ const RANGING_REPLY_DELAY_US: u16 = 12_000;
 const STARTUP_LED_PULSE_MS: u32 = 100;
 const DISCOVERY_LED_PULSE_MS: u32 = 100;
 const RANGE_UPDATE_LED_PULSE_MS: u32 = 50;
+const FAULT_LED_ON_MS: u32 = 120;
+const FAULT_LED_OFF_MS: u32 = 120;
+const FAULT_LED_PAUSE_MS: u32 = 700;
+const FAULT_BLINK_COUNT: usize = 3;
 const DW1000_SPI_MODE: hal::hal::spi::Mode = hal::hal::spi::Mode {
     polarity: hal::hal::spi::Polarity::IdleLow,
     phase: hal::hal::spi::Phase::CaptureOnFirstTransition,
@@ -208,6 +213,31 @@ where
     let _ = orange_led.set_low();
 }
 
+fn enter_fault_mode<P, Orange, Green>(
+    platform: &mut P,
+    orange_led: &mut Orange,
+    green_led: &mut Green,
+    message: &str,
+) -> !
+where
+    P: Platform,
+    Orange: OldOutputPin,
+    Green: OldOutputPin,
+{
+    platform.log(message);
+    let _ = orange_led.set_low();
+    let _ = green_led.set_low();
+    loop {
+        for _ in 0..FAULT_BLINK_COUNT {
+            let _ = orange_led.set_high();
+            platform.delay_ms(FAULT_LED_ON_MS);
+            let _ = orange_led.set_low();
+            platform.delay_ms(FAULT_LED_OFF_MS);
+        }
+        platform.delay_ms(FAULT_LED_PAUSE_MS);
+    }
+}
+
 fn maybe_log_fault<P: Platform>(
     platform: &mut P,
     last_fault_log_ms: &mut u32,
@@ -221,23 +251,32 @@ fn maybe_log_fault<P: Platform>(
     platform.log(message);
 }
 
-fn recover_runtime_fault<P, SPI, IRQ, RST, Led, const N: usize>(
-    platform: &mut P,
+fn recover_stalled_link<Delay, SPI, IRQ, RST, Orange, Green, const N: usize>(
+    platform: &mut Stm32Platform<Delay>,
     app: &mut App<Dw1000<SPI, IRQ, RST>, N>,
-    orange_led: &mut Led,
+    radio_config: &RadioConfig,
+    orange_led: &mut Orange,
+    green_led: &mut Green,
     orange_led_pulse: &mut Option<LedPulse>,
     last_fault_log_ms: &mut u32,
     now_ms: u32,
-    message: &str,
+    radio_gap_ms: u32,
+    range_gap_ms: u32,
     telemetry: &mut TelemetryCounters,
 ) where
-    P: Platform,
+    Delay: embedded_hal::delay::DelayNs,
     SPI: SpiDevice,
     IRQ: InputPin,
     RST: OutputPin<Error = IRQ::Error>,
-    Led: OldOutputPin,
+    Orange: OldOutputPin,
+    Green: OldOutputPin,
 {
-    maybe_log_fault(platform, last_fault_log_ms, now_ms, message);
+    maybe_log_fault(platform, last_fault_log_ms, now_ms, "link recovery");
+    info!(
+        "link recovery radio_gap={=u32} range_gap={=u32}",
+        radio_gap_ms,
+        range_gap_ms
+    );
     telemetry.recoveries = telemetry.recoveries.wrapping_add(1);
     start_led_pulse(
         orange_led,
@@ -245,8 +284,11 @@ fn recover_runtime_fault<P, SPI, IRQ, RST, Led, const N: usize>(
         now_ms,
         DISCOVERY_LED_PULSE_MS,
     );
+    if app.radio.init(platform.delay(), radio_config).is_err() {
+        enter_fault_mode(platform, orange_led, green_led, "radio reinit failed");
+    }
     if app.node.recover_link(&mut app.radio, now_ms).is_err() {
-        maybe_log_fault(platform, last_fault_log_ms, now_ms, "recovery failed");
+        enter_fault_mode(platform, orange_led, green_led, "link recovery failed");
     }
 }
 
@@ -327,7 +369,7 @@ pub fn run_with_antenna_delay(
         .pa9
         .into_push_pull_output(&mut gpioa.moder, &mut gpioa.otyper);
 
-    initialize_reference_board(
+    if let Err(message) = initialize_reference_board(
         role,
         &mut power_int,
         &mut ps_hold,
@@ -337,7 +379,9 @@ pub fn run_with_antenna_delay(
         &mut orange_led,
         &mut green_led,
         platform.delay(),
-    );
+    ) {
+        enter_fault_mode(&mut platform, &mut orange_led, &mut green_led, message);
+    }
     pulse_led_blocking(&mut orange_led, platform.delay(), STARTUP_LED_PULSE_MS);
 
     let sck = gpioa
@@ -357,9 +401,13 @@ pub fn run_with_antenna_delay(
     let irq = gpioa
         .pa2
         .into_floating_input(&mut gpioa.moder, &mut gpioa.pupdr);
-    let mut reset = gpioa
-        .pa1
-        .into_push_pull_output(&mut gpioa.moder, &mut gpioa.otyper);
+    // BU01 exposes DW1000 RSTn, which should only be pulled low by the host.
+    // Keep the line open-drain so releasing reset does not fight the module.
+    let mut reset = gpioa.pa1.into_open_drain_output_in_state(
+        &mut gpioa.moder,
+        &mut gpioa.otyper,
+        PinState::High,
+    );
     let _ = reset.set_low();
     platform.delay_ms(DW1000_RESET_PULSE_MS);
     let _ = reset.set_high();
@@ -373,14 +421,36 @@ pub fn run_with_antenna_delay(
         clocks,
         &mut rcc.apb2,
     );
-    let spi = ExclusiveDevice::new_no_delay(SpiBusCompat::new(spi_bus), OutputPinCompat::new(cs))
-        .unwrap();
+    let spi = match ExclusiveDevice::new_no_delay(SpiBusCompat::new(spi_bus), OutputPinCompat::new(cs))
+    {
+        Ok(spi) => spi,
+        Err(_) => enter_fault_mode(
+            &mut platform,
+            &mut orange_led,
+            &mut green_led,
+            "spi device init failed",
+        ),
+    };
     let mut radio = Dw1000::new(spi, InputPinCompat::new(irq), OutputPinCompat::new(reset));
     let radio_config = default_radio_config(identity, antenna_delay);
-    radio.init(platform.delay(), &radio_config).unwrap();
+    if radio.init(platform.delay(), &radio_config).is_err() {
+        enter_fault_mode(
+            &mut platform,
+            &mut orange_led,
+            &mut green_led,
+            "dw1000 init failed",
+        );
+    }
 
     let mut app = build_app::<_, PEER_CAPACITY>(radio, role, identity);
-    app.node.start(&mut app.radio, platform.now_ms()).unwrap();
+    if app.node.start(&mut app.radio, platform.now_ms()).is_err() {
+        enter_fault_mode(
+            &mut platform,
+            &mut orange_led,
+            &mut green_led,
+            "ranging start failed",
+        );
+    }
 
     info!("dw1000 antenna delay {=u16} ticks", antenna_delay.raw());
     info!("ranging reply delay {=u16} us", RANGING_REPLY_DELAY_US);
@@ -404,21 +474,7 @@ pub fn run_with_antenna_delay(
         let event = match app.node.tick(&mut app.radio, now_ms) {
             Ok(event) => event,
             Err(_) => {
-                recover_runtime_fault(
-                    &mut platform,
-                    &mut app,
-                    &mut orange_led,
-                    &mut orange_led_pulse,
-                    &mut last_fault_log_ms,
-                    now_ms,
-                    "tick fault",
-                    &mut telemetry,
-                );
-                update_led_pulse(&mut orange_led, &mut orange_led_pulse, now_ms);
-                if MAIN_LOOP_DELAY_MS != 0 {
-                    platform.delay_ms(MAIN_LOOP_DELAY_MS);
-                }
-                continue;
+                enter_fault_mode(&mut platform, &mut orange_led, &mut green_led, "tick fault");
             }
         };
         record_tick_transmit(&mut telemetry, tick_tx_before, app.node.tx_debug_snapshot());
@@ -446,24 +502,12 @@ pub fn run_with_antenna_delay(
             &mut telemetry,
         ) {
             Ok(outcome) => outcome,
-            Err(_) => {
-                let now_ms = platform.now_ms();
-                recover_runtime_fault(
-                    &mut platform,
-                    &mut app,
-                    &mut orange_led,
-                    &mut orange_led_pulse,
-                    &mut last_fault_log_ms,
-                    now_ms,
-                    "irq fault",
-                    &mut telemetry,
-                );
-                update_led_pulse(&mut orange_led, &mut orange_led_pulse, now_ms);
-                if MAIN_LOOP_DELAY_MS != 0 {
-                    platform.delay_ms(MAIN_LOOP_DELAY_MS);
-                }
-                continue;
-            }
+            Err(_) => enter_fault_mode(
+                &mut platform,
+                &mut orange_led,
+                &mut green_led,
+                "irq fault",
+            ),
         };
         let now_ms = platform.now_ms();
         if irq_outcome.range_updated {
@@ -482,21 +526,27 @@ pub fn run_with_antenna_delay(
         }
 
         let now_ms = platform.now_ms();
+        let radio_gap_ms = now_ms.wrapping_sub(last_radio_activity_ms);
+        let range_gap_ms = now_ms.wrapping_sub(last_range_update_ms);
         if app.node.peers().next().is_some()
-            && now_ms.wrapping_sub(last_radio_activity_ms) >= LINK_RECOVERY_TIMEOUT_MS
-            && now_ms.wrapping_sub(last_range_update_ms) >= LINK_RECOVERY_TIMEOUT_MS
+            && (radio_gap_ms >= LINK_RECOVERY_TIMEOUT_MS
+                || range_gap_ms >= LINK_RECOVERY_TIMEOUT_MS)
         {
-            recover_runtime_fault(
+            recover_stalled_link(
                 &mut platform,
                 &mut app,
+                &radio_config,
                 &mut orange_led,
+                &mut green_led,
                 &mut orange_led_pulse,
                 &mut last_fault_log_ms,
                 now_ms,
-                "link recovery",
+                radio_gap_ms,
+                range_gap_ms,
                 &mut telemetry,
             );
             last_radio_activity_ms = now_ms;
+            last_range_update_ms = now_ms;
             last_idle_log_ms = now_ms;
         }
         if now_ms.wrapping_sub(last_telemetry_log_ms) >= TELEMETRY_LOG_PERIOD_MS {
@@ -532,7 +582,8 @@ fn initialize_reference_board<
     orange_led: &mut Orange,
     green_led: &mut Green,
     delay: &mut Delay,
-) where
+) -> Result<(), &'static str>
+where
     PowerInt: OldInputPin,
     PsHold: OldOutputPin,
     ChargerEnable: OldOutputPin,
@@ -557,12 +608,12 @@ fn initialize_reference_board<
             let _ = orange_led.set_low();
             let _ = green_led.set_high();
             info!("stm6600 bootstrap complete");
-            return;
+            return Ok(());
         }
         delay.delay_ms(1);
     }
 
-    panic!("stm6600 power bootstrap timed out");
+    Err("stm6600 power bootstrap timed out")
 }
 
 fn service_radio_irq<P, SPI, IRQ, RST, const N: usize>(
