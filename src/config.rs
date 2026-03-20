@@ -6,6 +6,9 @@
 #[cfg(feature = "defmt")]
 use defmt::Format;
 
+use crate::device::{AntennaDelay, DeviceIdentity};
+use crate::time::DwTime;
+
 /// Data transmission/reception bit rate
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(Format))]
@@ -118,6 +121,13 @@ pub enum PreambleCode {
     Code19 = 19,
     /// Preamble code 20 (64 MHz PRF)
     Code20 = 20,
+}
+
+impl PreambleCode {
+    /// Returns the raw preamble-code value expected by the DW1000.
+    pub const fn raw(self) -> u8 {
+        self as u8
+    }
 }
 
 /// Frame length mode
@@ -366,5 +376,158 @@ impl DW1000Configuration {
     pub const fn with_receiver_auto_reenable(mut self, enabled: bool) -> Self {
         self.receiver_auto_reenable = enabled;
         self
+    }
+}
+
+/// Driver configuration validation errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub enum ConfigError {
+    /// The requested preamble length cannot be used with the selected PHY setup.
+    UnsupportedPreambleLength,
+}
+
+/// Addressing configuration written into the DW1000.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct AddressConfig {
+    /// Local device identity.
+    pub identity: DeviceIdentity,
+}
+
+/// User-provided PHY configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct PhyConfig {
+    /// Data rate.
+    pub data_rate: DataRate,
+    /// Pulse repetition frequency.
+    pub pulse_frequency: PulseFrequency,
+    /// Preamble length.
+    pub preamble_length: PreambleLength,
+    /// RF channel.
+    pub channel: Channel,
+    /// Optional explicit preamble code.
+    pub preamble_code: Option<PreambleCode>,
+    /// Smart power control.
+    pub smart_power: bool,
+}
+
+/// Driver-ready PHY configuration with all derived fields resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct ValidatedPhyConfig {
+    /// Data rate.
+    pub data_rate: DataRate,
+    /// Pulse repetition frequency.
+    pub pulse_frequency: PulseFrequency,
+    /// Preamble length.
+    pub preamble_length: PreambleLength,
+    /// RF channel.
+    pub channel: Channel,
+    /// Resolved preamble code.
+    pub preamble_code: PreambleCode,
+    /// Resolved PAC size.
+    pub pac_size: PacSize,
+    /// Smart power control.
+    pub smart_power: bool,
+}
+
+impl PhyConfig {
+    fn validated(self) -> Result<ValidatedPhyConfig, ConfigError> {
+        Ok(ValidatedPhyConfig {
+            data_rate: self.data_rate,
+            pulse_frequency: self.pulse_frequency,
+            preamble_length: self.preamble_length,
+            channel: self.channel,
+            preamble_code: self
+                .preamble_code
+                .unwrap_or(default_preamble_code(self.pulse_frequency)),
+            pac_size: pac_size_for_preamble(self.preamble_length),
+            smart_power: self.smart_power,
+        })
+    }
+}
+
+/// Complete radio configuration consumed by the driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct RadioConfig {
+    /// Local address configuration.
+    pub address: AddressConfig,
+    /// PHY configuration.
+    pub phy: PhyConfig,
+    /// Symmetric antenna delay.
+    pub antenna_delay: AntennaDelay,
+    /// Re-enable RX automatically after receive completion.
+    pub receiver_auto_reenable: bool,
+    /// Interrupt polarity (`true` = active high).
+    pub interrupt_polarity_high: bool,
+    /// Include/check the IEEE 802.15.4 frame check sequence.
+    pub frame_check: bool,
+}
+
+impl RadioConfig {
+    /// Builds a radio configuration from a logical identity and operating mode.
+    pub fn from_mode(identity: DeviceIdentity, mode: OperatingMode) -> Self {
+        let (data_rate, pulse_frequency, preamble_length) = mode.config();
+        Self {
+            address: AddressConfig { identity },
+            phy: PhyConfig {
+                data_rate,
+                pulse_frequency,
+                preamble_length,
+                channel: Channel::Channel5,
+                preamble_code: None,
+                smart_power: false,
+            },
+            antenna_delay: AntennaDelay::LEGACY_DEFAULT,
+            receiver_auto_reenable: true,
+            interrupt_polarity_high: true,
+            frame_check: true,
+        }
+    }
+
+    /// Validates and resolves derived PHY fields.
+    pub fn validated_phy(&self) -> Result<ValidatedPhyConfig, ConfigError> {
+        self.phy.validated()
+    }
+}
+
+/// Receive options for a single DW1000 receive session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct RxOptions {
+    /// Optional delayed start time relative to the current system timestamp.
+    pub delayed_time: Option<DwTime>,
+    /// Keep the receiver permanently armed.
+    pub permanent: bool,
+}
+
+/// Transmit options for a single DW1000 frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(Format))]
+pub struct TxOptions {
+    /// Optional delayed transmit time relative to the current system timestamp.
+    pub delayed_time: Option<DwTime>,
+    /// Set the WAIT4RESP bit after transmit.
+    pub wait_for_response: bool,
+}
+
+const fn default_preamble_code(pulse_frequency: PulseFrequency) -> PreambleCode {
+    match pulse_frequency {
+        PulseFrequency::Mhz16 => PreambleCode::Code4,
+        PulseFrequency::Mhz64 => PreambleCode::Code10,
+    }
+}
+
+const fn pac_size_for_preamble(preamble_length: PreambleLength) -> PacSize {
+    match preamble_length {
+        PreambleLength::Symbols64 | PreambleLength::Symbols128 => PacSize::Symbols8,
+        PreambleLength::Symbols256 | PreambleLength::Symbols512 => PacSize::Symbols16,
+        PreambleLength::Symbols1024 => PacSize::Symbols32,
+        PreambleLength::Symbols1536
+        | PreambleLength::Symbols2048
+        | PreambleLength::Symbols4096 => PacSize::Symbols64,
     }
 }

@@ -374,7 +374,7 @@ where
         self.tx_fctrl[1] |= ((rate as u8) << 5) & 0xFF;
         set_bit(&mut self.sys_cfg, RXM110K_BIT, rate == DataRate::Kbps110);
         let (dwsfd, tnssfd, rnssfd, sfd_len) = match rate {
-            DataRate::Kbps6800 => (false, false, false, 0x08),
+            DataRate::Mbps6800 => (false, false, false, 0x08),
             DataRate::Kbps850 => (true, true, true, 0x10),
             DataRate::Kbps110 => (true, false, false, 0x40),
         };
@@ -425,7 +425,7 @@ where
         let drx_tune0b = match phy.data_rate {
             DataRate::Kbps110 => 0x0016u16,
             DataRate::Kbps850 => 0x0006u16,
-            DataRate::Kbps6800 => 0x0001u16,
+            DataRate::Mbps6800 => 0x0001u16,
         };
         self.write_register(Register::DrxTune, DRX_TUNE0B_SUB, &drx_tune0b.to_le_bytes())?;
 
@@ -442,8 +442,8 @@ where
                 | PreambleLength::Symbols4096,
                 DataRate::Kbps110,
             ) => 0x0064,
-            (PreambleLength::Symbols64, DataRate::Kbps6800) => 0x0010,
-            (_, DataRate::Kbps850 | DataRate::Kbps6800) => 0x0020,
+            (PreambleLength::Symbols64, DataRate::Mbps6800) => 0x0010,
+            (_, DataRate::Kbps850 | DataRate::Mbps6800) => 0x0020,
             _ => return Err(Error::InvalidConfig(ConfigError::UnsupportedPreambleLength)),
         };
         self.write_register(Register::DrxTune, DRX_TUNE1B_SUB, &drx_tune1b.to_le_bytes())?;

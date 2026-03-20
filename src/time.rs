@@ -19,6 +19,9 @@ pub const TIME_RES_INV: f32 = 63897.6;
 /// Speed of radio waves [m/s] * timestamp resolution [~15.65ps] of DW1000
 pub const DISTANCE_OF_RADIO: f32 = 0.0046917639786159;
 
+/// Distance represented by one DW1000 timestamp tick, in meters.
+pub const DISTANCE_PER_TICK_M: f32 = DISTANCE_OF_RADIO;
+
 /// Inverse of DISTANCE_OF_RADIO for faster multiplication instead of division
 pub const DISTANCE_OF_RADIO_INV: f32 = 213.139451293;
 
@@ -63,6 +66,12 @@ impl DW1000Time {
         Self { timestamp: 0 }
     }
 
+    /// Creates a zero-valued timestamp.
+    #[inline]
+    pub const fn zero() -> Self {
+        Self::new()
+    }
+
     /// Creates a new `DW1000Time` from a raw timestamp value
     ///
     /// # Arguments
@@ -72,6 +81,12 @@ impl DW1000Time {
         let mut time = Self::new();
         time.set_timestamp(timestamp);
         time
+    }
+
+    /// Creates a new `DW1000Time` from raw DW1000 ticks.
+    #[inline]
+    pub const fn from_ticks(ticks: i64) -> Self {
+        Self { timestamp: ticks }
     }
 
     /// Creates a new `DW1000Time` from a byte array (little-endian)
@@ -93,6 +108,12 @@ impl DW1000Time {
         let mut time = Self::new();
         time.set_time(time_us);
         time
+    }
+
+    /// Creates a new `DW1000Time` from microseconds.
+    #[inline]
+    pub fn from_micros(time_us: f32) -> Self {
+        Self::from_microseconds(time_us)
     }
 
     /// Creates a new `DW1000Time` from a time value and factor
@@ -164,6 +185,12 @@ impl DW1000Time {
         data
     }
 
+    /// Returns the timestamp encoded as the DW1000 40-bit little-endian wire format.
+    #[inline]
+    pub fn to_bytes(&self) -> [u8; LENGTH_TIMESTAMP] {
+        self.get_timestamp_bytes()
+    }
+
     /// Returns the time in microseconds
     #[inline]
     pub fn as_microseconds(&self) -> f32 {
@@ -176,6 +203,26 @@ impl DW1000Time {
     #[inline]
     pub fn as_meters(&self) -> f32 {
         (self.timestamp % TIME_OVERFLOW) as f32 * DISTANCE_OF_RADIO
+    }
+
+    /// Computes asymmetric two-way-ranging time of flight from the six protocol timestamps.
+    pub fn asymmetric_tof(
+        poll_sent: Self,
+        poll_received: Self,
+        poll_ack_sent: Self,
+        poll_ack_received: Self,
+        range_sent: Self,
+        range_received: Self,
+    ) -> Self {
+        let round1 = (poll_ack_received - poll_sent).wrapped().timestamp as i128;
+        let reply1 = (poll_ack_sent - poll_received).wrapped().timestamp as i128;
+        let round2 = (range_received - poll_ack_sent).wrapped().timestamp as i128;
+        let reply2 = (range_sent - poll_ack_received).wrapped().timestamp as i128;
+        let denominator = round1 + round2 + reply1 + reply2;
+        if denominator == 0 {
+            return Self::zero();
+        }
+        Self::from_ticks(((round1 * round2 - reply1 * reply2) / denominator) as i64)
     }
 
     /// Wraps negative timestamps due to overflow
@@ -222,6 +269,9 @@ impl Default for DW1000Time {
         Self::new()
     }
 }
+
+/// Short alias used across the driver and ranging layers.
+pub type DwTime = DW1000Time;
 
 // Implement Add operations
 impl Add for DW1000Time {
