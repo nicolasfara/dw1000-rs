@@ -1,729 +1,826 @@
-use embassy_time::Instant;
-use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::{InputPin, OutputPin};
-use embedded_hal::spi::SpiDevice;
-use crate::constants::{FC_1, FC_1_BLINK, FC_2, FC_2_SHORT, LONG_MAC_LEN, NO_SUB, PANADR, SHORT_MAC_LEN};
-use crate::dw1000::{Dw1000, Dw1000Error};
-use crate::time::DW1000Time;
+//! Caller-driven tag and anchor ranging state machine.
 
-const LEN_DATA: usize = 90;
-const MAX_DEVICES: usize = 4;
+use heapless::Vec;
 
+use crate::config::{RxOptions, TxOptions};
+use crate::device::{DeviceIdentity, Peer, PeerSnapshot, RxFrame, ShortAddress, Timestamps};
+use crate::error::{Error, ProtocolError};
+use crate::protocol::{
+    decode_poll_targets, decode_range_timings, encode_discovery_blink, encode_poll,
+    encode_poll_ack, encode_range, encode_range_failed, encode_range_report, encode_ranging_init,
+    parse_frame, Frame, FrameKind, PollTarget, RangeReportPayload, RangeTiming,
+};
+use crate::time::DwTime;
+
+const MAX_FRAME_LEN: usize = 127;
+
+/// Role of the ranging state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum DeviceType {
-    Anchor,
+pub enum Role {
+    /// Discovery initiator and range calculator.
     Tag,
+    /// Discovery responder.
+    Anchor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum MessageType {
-    Poll = 0,
-    PollAck = 1,
-    Range = 2,
-    RangeReport = 3,
-    RangeFailed = 255,
-    Blink = 4,
-    RangingInit = 5,
-}
-
-impl MessageType {
-    fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(MessageType::Poll),
-            1 => Some(MessageType::PollAck),
-            2 => Some(MessageType::Range),
-            3 => Some(MessageType::RangeReport),
-            4 => Some(MessageType::Blink),
-            5 => Some(MessageType::RangingInit),
-            255 => Some(MessageType::RangeFailed),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct DeviceInfo {
-    pub address: [u8; 8],
-    pub short_address: [u8; 2],
-    pub range: f32,
-    pub rx_power: f32,
-    pub fp_power: f32,
-    pub quality: f32,
-}
-
-#[derive(Debug, Clone)]
+/// User-facing ranging event.
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RangingEvent {
-    None,
-    BlinkReceived { device: DeviceInfo },
-    NewDevice { device: DeviceInfo },
-    InactiveDevice { short_address: [u8; 2] },
-    NewRange { device: DeviceInfo },
-    RangingInitReceived { short_address: [u8; 2] },
-    DeviceNotFound { short_address: [u8; 2] },
-    UnexpectedMessage,
-    ProtocolFailed,
+    /// A blink frame was observed.
+    BlinkReceived(PeerSnapshot),
+    /// A peer was added to the table.
+    NewPeer(PeerSnapshot),
+    /// A peer was pruned due to inactivity.
+    PeerInactive(ShortAddress),
+    /// A new range measurement is available.
+    RangeUpdated(PeerSnapshot),
+    /// A ranging-init message was received.
+    RangingInitReceived(ShortAddress),
 }
 
-struct NetworkDevice {
-    address: [u8; 8],
-    short_address: [u8; 2],
-    index: u8,
-    range: f32,
-    rx_power: f32,
-    fp_power: f32,
-    quality: f32,
-    reply_time: u16,
-    time_poll_sent: DW1000Time,
-    time_poll_received: DW1000Time,
-    time_poll_ack_sent: DW1000Time,
-    time_poll_ack_received: DW1000Time,
-    time_range_sent: DW1000Time,
-    time_range_received: DW1000Time,
-    last_activity: Instant,
+/// Ranging configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RangingConfig {
+    /// Local identity used for frame addressing.
+    pub identity: DeviceIdentity,
+    /// Reply delay used by the protocol, in microseconds.
+    pub reply_delay_us: u16,
+    /// Inactivity timeout, in milliseconds.
+    pub reset_period_ms: u32,
+    /// Periodic timer tick, in milliseconds.
+    pub timer_period_ms: u32,
+    /// Optional exponential moving average factor.
+    pub range_filter: Option<u16>,
 }
 
-impl NetworkDevice {
-    fn new(address: [u8; 8], short_address: [u8; 2], index: u8) -> Self {
+impl RangingConfig {
+    /// Default tag/anchor configuration.
+    pub const fn new(identity: DeviceIdentity) -> Self {
         Self {
-            address,
-            short_address,
-            index,
-            range: 0.0,
-            rx_power: 0.0,
-            fp_power: 0.0,
-            quality: 0.0,
-            reply_time: 0,
-            time_poll_sent: DW1000Time::default(),
-            time_poll_received: DW1000Time::default(),
-            time_poll_ack_sent: DW1000Time::default(),
-            time_poll_ack_received: DW1000Time::default(),
-            time_range_sent: DW1000Time::default(),
-            time_range_received: DW1000Time::default(),
-            last_activity: Instant::now(),
-        }
-    }
-
-    fn note_activity(&mut self) {
-        self.last_activity = Instant::now();
-    }
-
-    fn is_inactive(&self, timeout_ms: u64) -> bool {
-        Instant::now().duration_since(self.last_activity).as_millis() > timeout_ms
-    }
-
-    fn to_device_info(&self) -> DeviceInfo {
-        DeviceInfo {
-            address: self.address,
-            short_address: self.short_address,
-            range: self.range,
-            rx_power: self.rx_power,
-            fp_power: self.fp_power,
-            quality: self.quality,
+            identity,
+            reply_delay_us: 7000,
+            reset_period_ms: 200,
+            timer_period_ms: 80,
+            range_filter: None,
         }
     }
 }
 
-pub struct Dw1000Ranging<'a, SPI, IRQ, RST, DELAY> {
-    module: &'a mut Dw1000<SPI, IRQ, RST, DELAY>,
-    device_type: DeviceType,
-    current_address: [u8; 8],
-    current_short_address: [u8; 2],
-    last_sent_to_short_address: [u8; 2],
-    network_devices: heapless::Vec<NetworkDevice, MAX_DEVICES>,
-    sent_ack: bool,
-    received_ack: bool,
-    last_activity: Instant,
-    data: [u8; LEN_DATA],
-    expected_msg_id: MessageType,
-    protocol_failed: bool,
-    reply_delay_time_us: u16,
-    timer_delay: u16,
-    reset_period: u32,
-    use_range_filter: bool,
-    range_filter_value: u16,
-    timer: Instant,
-    counter_for_blink: u16,
+/// Radio operations required by the ranging node.
+pub trait RangingRadio<SpiE, PinE> {
+    /// Starts the receiver with the supplied options.
+    fn start_receive(&mut self, options: RxOptions) -> Result<(), Error<SpiE, PinE>>;
+    /// Transmits a raw frame.
+    fn transmit(&mut self, frame: &[u8], options: TxOptions) -> Result<(), Error<SpiE, PinE>>;
+    /// Reads an RX frame into the supplied buffer.
+    fn read_frame<'a>(&mut self, buffer: &'a mut [u8]) -> Result<RxFrame<'a>, Error<SpiE, PinE>>;
+    /// Reads the latest timestamps.
+    fn read_timestamps(&mut self) -> Result<Timestamps, Error<SpiE, PinE>>;
+    /// Computes a delayed transmit time relative to now.
+    fn compute_delayed_time(&mut self, delay: DwTime) -> Result<DwTime, Error<SpiE, PinE>>;
 }
 
-impl<'a, SPI, IRQ, RST, DELAY> Dw1000Ranging<'a, SPI, IRQ, RST, DELAY>
+impl<SPI, IRQ, RST, SpiE, PinE> RangingRadio<SpiE, PinE> for crate::dw1000::Dw1000<SPI, IRQ, RST>
 where
-    SPI: SpiDevice,
-    IRQ: InputPin,
-    RST: OutputPin,
-    DELAY: DelayNs,
+    SPI: embedded_hal::spi::SpiDevice<Error = SpiE>,
+    IRQ: embedded_hal::digital::InputPin<Error = PinE>,
+    RST: embedded_hal::digital::OutputPin<Error = PinE>,
 {
-    const DEFAULT_RESET_PERIOD: u32 = 200;
-    const DEFAULT_REPLY_DELAY_TIME_US: u16 = 7000;
-    const DEFAULT_TIMER_DELAY: u16 = 80;
+    fn start_receive(&mut self, options: RxOptions) -> Result<(), Error<SpiE, PinE>> {
+        crate::dw1000::Dw1000::start_receive(self, options)
+    }
 
-    pub fn new(module: &'a mut Dw1000<SPI, IRQ, RST, DELAY>, device_type: DeviceType) -> Self {
-        Dw1000Ranging {
-            module,
-            device_type,
-            current_address: [0; 8],
-            current_short_address: [0; 2],
-            last_sent_to_short_address: [0; 2],
-            network_devices: heapless::Vec::new(),
-            sent_ack: false,
-            received_ack: false,
-            last_activity: Instant::now(),
-            data: [0u8; LEN_DATA],
-            expected_msg_id: MessageType::Poll,
-            protocol_failed: false,
-            reply_delay_time_us: Self::DEFAULT_REPLY_DELAY_TIME_US,
-            timer_delay: Self::DEFAULT_TIMER_DELAY,
-            reset_period: Self::DEFAULT_RESET_PERIOD,
-            use_range_filter: false,
-            range_filter_value: 15,
-            timer: Instant::now(),
-            counter_for_blink: 0,
+    fn transmit(&mut self, frame: &[u8], options: TxOptions) -> Result<(), Error<SpiE, PinE>> {
+        crate::dw1000::Dw1000::transmit(self, frame, options)
+    }
+
+    fn read_frame<'a>(&mut self, buffer: &'a mut [u8]) -> Result<RxFrame<'a>, Error<SpiE, PinE>> {
+        crate::dw1000::Dw1000::read_frame(self, buffer)
+    }
+
+    fn read_timestamps(&mut self) -> Result<Timestamps, Error<SpiE, PinE>> {
+        crate::dw1000::Dw1000::read_timestamps(self)
+    }
+
+    fn compute_delayed_time(&mut self, delay: DwTime) -> Result<DwTime, Error<SpiE, PinE>> {
+        crate::dw1000::Dw1000::compute_delayed_time(self, delay)
+    }
+}
+
+/// Tag/anchor ranging state machine.
+#[derive(Debug)]
+pub struct RangingNode<const N: usize> {
+    role: Role,
+    config: RangingConfig,
+    peers: Vec<Peer, N>,
+    sequence: u8,
+    expected: FrameKind,
+    last_activity_ms: u32,
+    blink_counter: u8,
+    last_tick_ms: u32,
+    last_tx_kind: Option<FrameKind>,
+    last_tx_destination: ShortAddress,
+    poll_acknowledged: Vec<ShortAddress, N>,
+}
+
+impl<const N: usize> RangingNode<N> {
+    /// Creates a ranging node.
+    pub fn new(role: Role, config: RangingConfig) -> Self {
+        Self {
+            role,
+            config,
+            peers: Vec::new(),
+            sequence: 0,
+            expected: match role {
+                Role::Tag => FrameKind::PollAck,
+                Role::Anchor => FrameKind::Poll,
+            },
+            last_activity_ms: 0,
+            blink_counter: 0,
+            last_tick_ms: 0,
+            last_tx_kind: None,
+            last_tx_destination: ShortAddress::BROADCAST,
+            poll_acknowledged: Vec::new(),
         }
     }
 
-    pub fn init_communication(&mut self) -> Result<(), Dw1000Error<SPI::Error>> {
-        self.module.init()
-    }
-
-    /// Configure the DW1000 network parameters
-    ///
-    /// This corresponds to DW1000Ranging::configureNetwork() in the C++ implementation.
-    /// It sets up device address, network ID, and operation mode (data rate, pulse frequency, preamble length).
-    ///
-    /// # Arguments
-    /// * `device_address` - The short device address (16-bit)
-    /// * `network_id` - The network/PAN ID (16-bit)
-    /// * `mode` - Configuration mode as [data_rate, pulse_frequency, preamble_length]
-    ///
-    /// # Example
-    /// ```ignore
-    /// // MODE_LONGDATA_RANGE_LOWPOWER equivalent: [TRX_RATE_110KBPS, TX_PULSE_FREQ_16MHZ, TX_PREAMBLE_LEN_2048]
-    /// ranging.configure_network(0x1234, 0xDECA, &[0x00, 0x01, 0x0C])?;
-    /// ```
-    pub fn configure_network(
+    /// Starts the node and arms permanent receive mode.
+    pub fn start<R, SpiE, PinE>(
         &mut self,
-        device_address: u16,
-        network_id: u16,
-        mode: &[u8],
-    ) -> Result<(), Dw1000Error<SPI::Error>> {
-        // Put device in idle mode
-        self.module.idle()?;
-        self.module.set_device_address(device_address);
-        self.module.set_network_id(network_id);
-        self.module.enable_mode(mode);
-        self.module.commit_configuration()
+        radio: &mut R,
+        now_ms: u32,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        self.last_activity_ms = now_ms;
+        self.last_tick_ms = now_ms;
+        radio.start_receive(RxOptions {
+            delayed_time: None,
+            permanent: true,
+        })
     }
 
-    pub fn start(&mut self, address: &str, mode: &[u8]) -> Result<(), Dw1000Error<SPI::Error>> {
-        self.module.set_eui(address)?;
-        self.configure_network(self.current_short_address[0] as u16 | ((self.current_short_address[1] as u16) << 8), 0xDECA, mode)
-    }
-
-    fn general_start(&mut self) -> Result<(), Dw1000Error<SPI::Error>> {
-        todo!()
-    }
-
-    pub fn set_current_address(&mut self, address: [u8; 8], short_address: [u8; 2]) {
-        self.current_address = address;
-        self.current_short_address = short_address;
-    }
-
-    pub fn set_use_range_filter(&mut self, enabled: bool) {
-        self.use_range_filter = enabled;
-    }
-
-    pub fn set_range_filter_value(&mut self, value: u16) {
-        self.range_filter_value = if value < 2 { 2 } else { value };
-    }
-
-    pub fn round(&mut self) -> Result<RangingEvent, Dw1000Error<SPI::Error>> {
-        self.check_for_reset();
-
-        let now = Instant::now();
-        if now.duration_since(self.timer).as_millis() > self.timer_delay as u64 {
-            self.timer = now;
-            return self.timer_tick();
-        }
-
-        if self.sent_ack {
-            self.sent_ack = false;
-            let message_type = Self::detect_message_type(&self.data);
-
-            if let Some(msg_type) = message_type {
-                if msg_type != MessageType::PollAck
-                    && msg_type != MessageType::Poll
-                    && msg_type != MessageType::Range
-                {
-                    return Ok(RangingEvent::None);
-                }
-
-                match self.device_type {
-                    DeviceType::Anchor => {
-                        if msg_type == MessageType::PollAck {
-                            let short_address = self.last_sent_to_short_address;
-                            if let Some(_device) = self.search_distant_device_mut(&short_address) {
-                                // Get transmit timestamp - placeholder for actual implementation
-                                // _device.time_poll_ack_sent = self.module.get_transmit_timestamp()?;
-                            }
-                        }
-                    }
-                    DeviceType::Tag => {
-                        if msg_type == MessageType::Poll {
-                            // Get transmit timestamp - placeholder
-                            // let time_poll_sent = self.module.get_transmit_timestamp()?;
-
-                            if self.last_sent_to_short_address == [0xFF, 0xFF] {
-                                // Broadcast - update all devices
-                                for _device in &mut self.network_devices {
-                                    // _device.time_poll_sent = time_poll_sent;
-                                }
-                            } else {
-                                let short_address = self.last_sent_to_short_address;
-                                if let Some(_device) = self.search_distant_device_mut(&short_address) {
-                                    // _device.time_poll_sent = time_poll_sent;
-                                }
-                            }
-                        } else if msg_type == MessageType::Range {
-                            // Similar logic for Range
-                            if self.last_sent_to_short_address == [0xFF, 0xFF] {
-                                for _device in &mut self.network_devices {
-                                    // _device.time_range_sent = time_range_sent;
-                                }
-                            } else {
-                                let short_address = self.last_sent_to_short_address;
-                                if let Some(_device) = self.search_distant_device_mut(&short_address) {
-                                    // _device.time_range_sent = time_range_sent;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if self.received_ack {
-            self.received_ack = false;
-
-            // Read data from module - placeholder
-            // self.module.get_data(&mut self.data)?;
-
-            let message_type = Self::detect_message_type(&self.data);
-
-            if let Some(msg_type) = message_type {
-                return self.handle_received_message(msg_type);
-            }
-        }
-
-        Ok(RangingEvent::None)
-    }
-
-    fn handle_received_message(
+    /// Resets protocol state and re-arms permanent receive without pruning peers.
+    pub fn recover_link<R, SpiE, PinE>(
         &mut self,
-        message_type: MessageType,
-    ) -> Result<RangingEvent, Dw1000Error<SPI::Error>> {
-        match (message_type, self.device_type) {
-            (MessageType::Blink, DeviceType::Anchor) => {
-                let mut address = [0u8; 8];
-                let mut short_address = [0u8; 2];
-                self.decode_blink_frame(&mut address, &mut short_address);
-
-                if self.add_network_device(address, short_address) {
-                    // transmitRangingInit - placeholder
-                    self.note_activity();
-                    self.expected_msg_id = MessageType::Poll;
-                    return Ok(RangingEvent::BlinkReceived {
-                        device: DeviceInfo {
-                            address,
-                            short_address,
-                            range: 0.0,
-                            rx_power: 0.0,
-                            fp_power: 0.0,
-                            quality: 0.0,
-                        },
-                    });
-                }
-            }
-
-            (MessageType::RangingInit, DeviceType::Tag) => {
-                let mut short_address = [0u8; 2];
-                self.decode_long_mac_frame(&mut short_address);
-
-                if self.add_network_device_short(short_address) {
-                    self.note_activity();
-                    return Ok(RangingEvent::NewDevice {
-                        device: DeviceInfo {
-                            address: [0; 8],
-                            short_address,
-                            range: 0.0,
-                            rx_power: 0.0,
-                            fp_power: 0.0,
-                            quality: 0.0,
-                        },
-                    });
-                }
-            }
-
-            _ => {
-                // Short MAC frame
-                let mut address = [0u8; 2];
-                self.decode_short_mac_frame(&mut address);
-
-                let device_index = self.search_distant_device_index(&address);
-
-                if device_index.is_none() {
-                    return Ok(RangingEvent::DeviceNotFound {
-                        short_address: address,
-                    });
-                }
-
-                return match self.device_type {
-                    DeviceType::Anchor => {
-                        self.handle_anchor_message(message_type, device_index.unwrap())
-                    }
-                    DeviceType::Tag => {
-                        self.handle_tag_message(message_type, device_index.unwrap())
-                    }
-                }
-            }
-        }
-
-        Ok(RangingEvent::None)
+        radio: &mut R,
+        now_ms: u32,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        self.reset_protocol_state();
+        self.last_activity_ms = now_ms;
+        self.last_tick_ms = now_ms;
+        radio.start_receive(RxOptions {
+            delayed_time: None,
+            permanent: true,
+        })
     }
 
-    fn handle_anchor_message(
+    /// Handles a completed transmission.
+    pub fn on_tx_done<R, SpiE, PinE>(
         &mut self,
-        message_type: MessageType,
-        device_index: usize,
-    ) -> Result<RangingEvent, Dw1000Error<SPI::Error>> {
-        if message_type != self.expected_msg_id {
-            self.protocol_failed = true;
-        }
-
-        match message_type {
-            MessageType::Poll => {
-                let number_devices = self.data[SHORT_MAC_LEN as usize + 1] as usize;
-
-                for i in 0..number_devices {
-                    let offset = SHORT_MAC_LEN as usize + 2 + i * 4;
-                    let short_address = [self.data[offset], self.data[offset + 1]];
-
-                    if short_address == self.current_short_address {
-                        let reply_time =
-                            u16::from_le_bytes([self.data[offset + 2], self.data[offset + 3]]);
-                        self.reply_delay_time_us = reply_time;
-                        self.protocol_failed = false;
-
-                        if let Some(device) = self.network_devices.get_mut(device_index) {
-                            // device.time_poll_received = self.module.get_receive_timestamp()?;
-                            device.note_activity();
-                        }
-
-                        self.expected_msg_id = MessageType::Range;
-                        // transmitPollAck - placeholder
-                        self.note_activity();
-                        break;
-                    }
+        radio: &mut R,
+    ) -> Result<Option<RangingEvent>, Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        let Some(kind) = self.last_tx_kind else {
+            return Ok(None);
+        };
+        let timestamps = radio.read_timestamps()?;
+        match (self.role, kind) {
+            (Role::Anchor, FrameKind::PollAck) => {
+                if let Some(peer) = self.peer_mut(self.last_tx_destination) {
+                    peer.poll_ack_sent = timestamps.tx;
                 }
             }
-
-            MessageType::Range => {
-                let number_devices = self.data[SHORT_MAC_LEN as usize + 1] as usize;
-
-                for i in 0..number_devices {
-                    let offset = SHORT_MAC_LEN as usize + 2 + i * 17;
-                    let short_address = [self.data[offset], self.data[offset + 1]];
-
-                    if short_address == self.current_short_address {
-                        if let Some(device) = self.network_devices.get_mut(device_index) {
-                            // device.time_range_received = self.module.get_receive_timestamp()?;
-                            self.expected_msg_id = MessageType::Poll;
-
-                            if !self.protocol_failed {
-                                // Extract timestamps
-                                // device.time_poll_sent.set_timestamp(&self.data[offset + 4..]);
-                                // device.time_poll_ack_received.set_timestamp(&self.data[offset + 9..]);
-                                // device.time_range_sent.set_timestamp(&self.data[offset + 14..]);
-
-                                // Compute range
-                                let time_poll_sent = device.time_poll_sent;
-                                let time_poll_received = device.time_poll_received;
-                                let time_poll_ack_sent = device.time_poll_ack_sent;
-                                let time_poll_ack_received = device.time_poll_ack_received;
-                                let time_range_sent = device.time_range_sent;
-                                let time_range_received = device.time_range_received;
-
-                                let distance = Self::compute_range_asymmetric_static(
-                                    time_poll_sent,
-                                    time_poll_received,
-                                    time_poll_ack_sent,
-                                    time_poll_ack_received,
-                                    time_range_sent,
-                                    time_range_received,
-                                );
-
-                                let filtered_distance = if self.use_range_filter && device.range != 0.0
-                                {
-                                    Self::filter_value(
-                                        distance,
-                                        device.range,
-                                        self.range_filter_value,
-                                    )
-                                } else {
-                                    distance
-                                };
-
-                                // device.rx_power = self.module.get_receive_power()?;
-                                device.range = filtered_distance;
-                                // device.fp_power = self.module.get_first_path_power()?;
-                                // device.quality = self.module.get_receive_quality()?;
-
-                                // transmitRangeReport - placeholder
-                                let device_info = device.to_device_info();
-                                self.note_activity();
-
-                                return Ok(RangingEvent::NewRange {
-                                    device: device_info,
-                                });
-                            } else {
-                                // transmitRangeFailed - placeholder
-                            }
-                        }
-                        self.note_activity();
-                        break;
+            (Role::Tag, FrameKind::Poll) => {
+                if self.last_tx_destination.is_broadcast() {
+                    for peer in self.peers.iter_mut() {
+                        peer.poll_sent = timestamps.tx;
                     }
+                } else if let Some(peer) = self.peer_mut(self.last_tx_destination) {
+                    peer.poll_sent = timestamps.tx;
                 }
             }
-
+            (Role::Tag, FrameKind::Range) => {
+                if self.last_tx_destination.is_broadcast() {
+                    for peer in self.peers.iter_mut() {
+                        peer.range_sent = timestamps.tx;
+                    }
+                } else if let Some(peer) = self.peer_mut(self.last_tx_destination) {
+                    peer.range_sent = timestamps.tx;
+                }
+            }
             _ => {}
         }
-
-        Ok(RangingEvent::None)
+        Ok(None)
     }
 
-    fn handle_tag_message(
+    /// Handles an incoming frame.
+    pub fn on_rx<R, SpiE, PinE>(
         &mut self,
-        message_type: MessageType,
-        device_index: usize,
-    ) -> Result<RangingEvent, Dw1000Error<SPI::Error>> {
-        if message_type != self.expected_msg_id {
-            return Ok(RangingEvent::UnexpectedMessage);
-        }
-
-        match message_type {
-            MessageType::PollAck => {
-                if let Some(device) = self.network_devices.get_mut(device_index) {
-                    // device.time_poll_ack_received = self.module.get_receive_timestamp()?;
-                    device.note_activity();
-
-                    if device.index == (self.network_devices.len() - 1) as u8 {
-                        self.expected_msg_id = MessageType::RangeReport;
-                        // transmitRange(nullptr) - broadcast
-                    }
+        radio: &mut R,
+        now_ms: u32,
+        buffer: &mut [u8],
+    ) -> Result<Option<RangingEvent>, Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        let frame = radio.read_frame(buffer)?;
+        self.last_activity_ms = now_ms;
+        match parse_frame(frame.bytes)? {
+            Frame::Blink(blink) if self.role == Role::Anchor => {
+                self.reset_protocol_state();
+                let peer = self.ensure_peer(Some(blink.source_eui), blink.source_short, now_ms)?;
+                let snapshot = PeerSnapshot::from(peer);
+                self.send_ranging_init(radio, blink.source_eui, blink.source_short)?;
+                Ok(Some(RangingEvent::BlinkReceived(snapshot)))
+            }
+            Frame::RangingInit(header) if self.role == Role::Tag => {
+                self.reset_protocol_state();
+                let peer = self.ensure_peer(None, header.source, now_ms)?;
+                Ok(Some(RangingEvent::RangingInitReceived(peer.short_address)))
+            }
+            Frame::Poll { header, payload } if self.role == Role::Anchor => {
+                if self.expected != FrameKind::Poll {
+                    self.reset_protocol_state();
                 }
+                let mut targets = [PollTarget {
+                    short_address: ShortAddress::new(0),
+                    reply_delay_us: 0,
+                }; N];
+                let count = decode_poll_targets(payload, &mut targets)?;
+                let local = self.config.identity.short_address;
+                let Some(target) = targets[..count]
+                    .iter()
+                    .find(|target| target.short_address == local)
+                    .copied()
+                else {
+                    return Ok(None);
+                };
+                let peer = self
+                    .peer_mut(header.source)
+                    .ok_or(ProtocolError::UnknownPeer)?;
+                peer.poll_received = frame.timestamp;
+                peer.last_activity_ms = now_ms;
+                peer.reply_delay_us = target.reply_delay_us;
+                let destination = peer.short_address;
+                self.expected = FrameKind::Range;
+                self.send_poll_ack(radio, destination, target.reply_delay_us)?;
+                Ok(None)
             }
-
-            MessageType::RangeReport => {
-                if let Some(device) = self.network_devices.get_mut(device_index) {
-                    let offset = 1 + SHORT_MAC_LEN as usize;
-                    let cur_range = f32::from_le_bytes([
-                        self.data[offset],
-                        self.data[offset + 1],
-                        self.data[offset + 2],
-                        self.data[offset + 3],
-                    ]);
-                    let cur_rx_power = f32::from_le_bytes([
-                        self.data[offset + 4],
-                        self.data[offset + 5],
-                        self.data[offset + 6],
-                        self.data[offset + 7],
-                    ]);
-
-                    let filtered_range = if self.use_range_filter && device.range != 0.0 {
-                        Self::filter_value(cur_range, device.range, self.range_filter_value)
-                    } else {
-                        cur_range
-                    };
-
-                    device.range = filtered_range;
-                    device.rx_power = cur_rx_power;
-
-                    return Ok(RangingEvent::NewRange {
-                        device: device.to_device_info(),
-                    });
+            Frame::PollAck { header } if self.role == Role::Tag => {
+                if self.expected != FrameKind::PollAck {
+                    self.reset_protocol_state();
+                    return Ok(None);
                 }
+                let short_address = {
+                    let peer = self
+                        .peer_mut(header.source)
+                        .ok_or(ProtocolError::UnknownPeer)?;
+                    peer.poll_ack_received = frame.timestamp;
+                    peer.last_activity_ms = now_ms;
+                    peer.short_address
+                };
+                if !self.poll_acknowledged.contains(&short_address) {
+                    self.poll_acknowledged
+                        .push(short_address)
+                        .map_err(|_| ProtocolError::PeerTableFull)?;
+                }
+                if self.poll_acknowledged.len() == self.peers.len() {
+                    self.expected = FrameKind::RangeReport;
+                    self.send_range(radio, None)?;
+                }
+                Ok(None)
             }
-
-            MessageType::RangeFailed => {
-                return Ok(RangingEvent::ProtocolFailed);
+            Frame::Range { header, payload } if self.role == Role::Anchor => {
+                if self.expected != FrameKind::Range {
+                    self.reset_protocol_state();
+                    return Ok(None);
+                }
+                let mut timings = [RangeTiming {
+                    short_address: ShortAddress::new(0),
+                    poll_sent: DwTime::zero(),
+                    poll_ack_received: DwTime::zero(),
+                    range_sent: DwTime::zero(),
+                }; N];
+                let count = decode_range_timings(payload, &mut timings)?;
+                let local = self.config.identity.short_address;
+                let Some(timing) = timings[..count]
+                    .iter()
+                    .find(|timing| timing.short_address == local)
+                    .copied()
+                else {
+                    return Ok(None);
+                };
+                self.expected = FrameKind::Poll;
+                let range_filter = self.config.range_filter;
+                let (destination, reply_delay_us, report, snapshot) = {
+                    let peer = self
+                        .peer_mut(header.source)
+                        .ok_or(ProtocolError::UnknownPeer)?;
+                    peer.range_received = frame.timestamp;
+                    peer.poll_sent = timing.poll_sent;
+                    peer.poll_ack_received = timing.poll_ack_received;
+                    peer.range_sent = timing.range_sent;
+                    peer.metrics = frame.metrics;
+                    peer.last_activity_ms = now_ms;
+                    let tof = DwTime::asymmetric_tof(
+                        peer.poll_sent,
+                        peer.poll_received,
+                        peer.poll_ack_sent,
+                        peer.poll_ack_received,
+                        peer.range_sent,
+                        peer.range_received,
+                    );
+                    let distance = filtered_range(range_filter, peer.range_m, tof.as_meters());
+                    peer.range_m = distance;
+                    (
+                        peer.short_address,
+                        peer.reply_delay_us,
+                        RangeReportPayload {
+                            poll_received: peer.poll_received,
+                            poll_ack_sent: peer.poll_ack_sent,
+                            range_received: peer.range_received,
+                            receive_power_dbm: frame.metrics.receive_power_dbm,
+                        },
+                        PeerSnapshot::from(&*peer),
+                    )
+                };
+                self.send_range_report(radio, destination, report, reply_delay_us)?;
+                Ok(Some(RangingEvent::RangeUpdated(snapshot)))
             }
-
-            _ => {}
+            Frame::RangeReport { header, payload } if self.role == Role::Tag => {
+                if self.expected != FrameKind::RangeReport {
+                    self.reset_protocol_state();
+                    return Ok(None);
+                }
+                let range_filter = self.config.range_filter;
+                let snapshot = {
+                    let peer = self
+                        .peer_mut(header.source)
+                        .ok_or(ProtocolError::UnknownPeer)?;
+                    let tof = DwTime::asymmetric_tof(
+                        peer.poll_sent,
+                        payload.poll_received,
+                        payload.poll_ack_sent,
+                        peer.poll_ack_received,
+                        peer.range_sent,
+                        payload.range_received,
+                    );
+                    peer.range_m = filtered_range(range_filter, peer.range_m, tof.as_meters());
+                    peer.metrics.receive_power_dbm = payload.receive_power_dbm;
+                    peer.metrics.first_path_power_dbm = frame.metrics.first_path_power_dbm;
+                    peer.metrics.quality = frame.metrics.quality;
+                    peer.last_activity_ms = now_ms;
+                    PeerSnapshot::from(&*peer)
+                };
+                Ok(Some(RangingEvent::RangeUpdated(snapshot)))
+            }
+            Frame::RangeFailed { header } if self.role == Role::Tag => {
+                self.reset_protocol_state();
+                self.peer_mut(header.source)
+                    .ok_or(ProtocolError::UnknownPeer)?
+                    .last_activity_ms = now_ms;
+                Ok(None)
+            }
+            _ => Ok(None),
         }
-
-        Ok(RangingEvent::None)
     }
 
-    fn detect_message_type(datas: &[u8]) -> Option<MessageType> {
-        if datas[0] == FC_1_BLINK {
-            Some(MessageType::Blink)
-        } else if datas[0] == FC_1 && datas[1] == FC_2 {
-            MessageType::from_u8(datas[LONG_MAC_LEN as usize])
-        } else if datas[0] == FC_1 && datas[1] == FC_2_SHORT {
-            MessageType::from_u8(datas[SHORT_MAC_LEN as usize])
+    /// Periodic maintenance and discovery tick.
+    pub fn tick<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        now_ms: u32,
+    ) -> Result<Option<RangingEvent>, Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        if let Some(position) = self.peers.iter().position(|peer| {
+            now_ms.saturating_sub(peer.last_activity_ms) > self.config.reset_period_ms
+        }) {
+            let short = self.peers.swap_remove(position).short_address;
+            self.reset_protocol_state();
+            return Ok(Some(RangingEvent::PeerInactive(short)));
+        }
+
+        if now_ms.saturating_sub(self.last_tick_ms) < self.config.timer_period_ms {
+            return Ok(None);
+        }
+        self.last_tick_ms = now_ms;
+
+        if self.role == Role::Tag {
+            if !self.peers.is_empty() && self.blink_counter != 0 {
+                self.expected = FrameKind::PollAck;
+                self.poll_acknowledged.clear();
+                self.send_poll(radio, None)?;
+            } else {
+                self.send_blink(radio)?;
+            }
+            self.blink_counter = if self.blink_counter >= 20 {
+                0
+            } else {
+                self.blink_counter + 1
+            };
+        }
+        Ok(None)
+    }
+
+    /// Returns the current peer snapshots.
+    pub fn peers(&self) -> impl Iterator<Item = PeerSnapshot> + '_ {
+        self.peers.iter().map(PeerSnapshot::from)
+    }
+
+    /// Returns the role this node was configured with.
+    pub const fn role(&self) -> Role {
+        self.role
+    }
+
+    /// Returns a lightweight snapshot of the most recent transmit state.
+    pub fn tx_debug_snapshot(&self) -> (u8, Option<FrameKind>) {
+        (self.sequence, self.last_tx_kind)
+    }
+
+    fn send_blink<R, SpiE, PinE>(&mut self, radio: &mut R) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_discovery_blink(
+            self.next_sequence(),
+            self.config.identity.eui,
+            self.config.identity.short_address,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::Blink);
+        self.last_tx_destination = ShortAddress::BROADCAST;
+        radio.transmit(&frame[..len], TxOptions::default())
+    }
+
+    fn send_ranging_init<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        destination_eui: crate::device::Eui64,
+        destination_short: ShortAddress,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_ranging_init(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            destination_eui,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::RangingInit);
+        self.last_tx_destination = destination_short;
+        radio.transmit(&frame[..len], TxOptions::default())
+    }
+
+    fn send_poll<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        destination: Option<ShortAddress>,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let mut targets = [PollTarget {
+            short_address: ShortAddress::new(0),
+            reply_delay_us: 0,
+        }; N];
+        let destination = destination.unwrap_or(ShortAddress::BROADCAST);
+        let count = if destination.is_broadcast() {
+            for (index, peer) in self.peers.iter_mut().enumerate() {
+                peer.reply_delay_us = ((2 * index + 1) as u16) * self.config.reply_delay_us;
+                targets[index] = PollTarget {
+                    short_address: peer.short_address,
+                    reply_delay_us: peer.reply_delay_us,
+                };
+            }
+            self.peers.len()
         } else {
-            None
-        }
+            let reply_delay = self.config.reply_delay_us;
+            let peer = self
+                .peer_mut(destination)
+                .ok_or(ProtocolError::UnknownPeer)?;
+            peer.reply_delay_us = reply_delay;
+            targets[0] = PollTarget {
+                short_address: peer.short_address,
+                reply_delay_us: peer.reply_delay_us,
+            };
+            1
+        };
+        let len = encode_poll(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            destination,
+            &targets[..count],
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::Poll);
+        self.last_tx_destination = destination;
+        radio.transmit(&frame[..len], TxOptions::default())
     }
 
-    fn check_for_reset(&mut self) {
-        let now = Instant::now();
-        if !self.sent_ack
-            && !self.received_ack
-            && (now.duration_since(self.last_activity).as_millis() > self.reset_period as u64)
-        {
-            self.reset_inactive();
-        }
-    }
-
-    fn reset_inactive(&mut self) {
-        if self.device_type == DeviceType::Anchor {
-            self.expected_msg_id = MessageType::Poll;
-            // receiver() - placeholder
-        }
-        self.note_activity();
-    }
-
-    fn timer_tick(&mut self) -> Result<RangingEvent, Dw1000Error<SPI::Error>> {
-        if !self.network_devices.is_empty() && self.counter_for_blink != 0 {
-            if self.device_type == DeviceType::Tag {
-                self.expected_msg_id = MessageType::PollAck;
-                // transmitPoll(nullptr) - broadcast poll
-            }
-        } else if self.counter_for_blink == 0 {
-            if self.device_type == DeviceType::Tag {
-                // transmitBlink()
-            }
-            return self.check_for_inactive_devices();
-        }
-
-        self.counter_for_blink += 1;
-        if self.counter_for_blink > 20 {
-            self.counter_for_blink = 0;
-        }
-
-        Ok(RangingEvent::None)
-    }
-
-    fn check_for_inactive_devices(&mut self) -> Result<RangingEvent, Dw1000Error<SPI::Error>> {
-        let mut inactive_index = None;
-
-        for (i, device) in self.network_devices.iter().enumerate() {
-            if device.is_inactive(self.reset_period as u64) {
-                inactive_index = Some(i);
-                break;
-            }
-        }
-
-        if let Some(index) = inactive_index {
-            let short_address = self.network_devices[index].short_address;
-            self.network_devices.swap_remove(index);
-
-            // Update indices
-            for (i, device) in self.network_devices.iter_mut().enumerate() {
-                device.index = i as u8;
-            }
-
-            return Ok(RangingEvent::InactiveDevice { short_address });
-        }
-
-        Ok(RangingEvent::None)
-    }
-
-    fn search_distant_device(&self, short_address: &[u8; 2]) -> Option<&NetworkDevice> {
-        self.network_devices
-            .iter()
-            .find(|d| d.short_address == *short_address)
-    }
-
-    fn search_distant_device_mut(
+    fn send_poll_ack<R, SpiE, PinE>(
         &mut self,
-        short_address: &[u8; 2],
-    ) -> Option<&mut NetworkDevice> {
-        self.network_devices
-            .iter_mut()
-            .find(|d| d.short_address == *short_address)
+        radio: &mut R,
+        destination: ShortAddress,
+        reply_delay_us: u16,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_poll_ack(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            destination,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::PollAck);
+        self.last_tx_destination = destination;
+        radio.transmit(
+            &frame[..len],
+            TxOptions {
+                delayed_time: Some(DwTime::from_micros(reply_delay_us as f32)),
+                wait_for_response: false,
+            },
+        )
     }
 
-    fn search_distant_device_index(&self, short_address: &[u8; 2]) -> Option<usize> {
-        self.network_devices
+    fn send_range<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        destination: Option<ShortAddress>,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let mut timings = [RangeTiming {
+            short_address: ShortAddress::new(0),
+            poll_sent: DwTime::zero(),
+            poll_ack_received: DwTime::zero(),
+            range_sent: DwTime::zero(),
+        }; N];
+        let destination = destination.unwrap_or(ShortAddress::BROADCAST);
+        let delay = DwTime::from_micros(self.config.reply_delay_us as f32);
+        let range_sent = radio.compute_delayed_time(delay)?;
+        let count = if destination.is_broadcast() {
+            for (index, peer) in self.peers.iter().enumerate() {
+                timings[index] = RangeTiming {
+                    short_address: peer.short_address,
+                    poll_sent: peer.poll_sent,
+                    poll_ack_received: peer.poll_ack_received,
+                    range_sent,
+                };
+            }
+            self.peers.len()
+        } else {
+            let peer = self.peer(destination).ok_or(ProtocolError::UnknownPeer)?;
+            timings[0] = RangeTiming {
+                short_address: peer.short_address,
+                poll_sent: peer.poll_sent,
+                poll_ack_received: peer.poll_ack_received,
+                range_sent,
+            };
+            1
+        };
+        let len = encode_range(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            destination,
+            &timings[..count],
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::Range);
+        self.last_tx_destination = destination;
+        radio.transmit(
+            &frame[..len],
+            TxOptions {
+                delayed_time: Some(delay),
+                wait_for_response: false,
+            },
+        )
+    }
+
+    fn send_range_report<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        destination: ShortAddress,
+        payload: RangeReportPayload,
+        reply_delay_us: u16,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_range_report(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            destination,
+            payload,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::RangeReport);
+        self.last_tx_destination = destination;
+        radio.transmit(
+            &frame[..len],
+            TxOptions {
+                delayed_time: Some(DwTime::from_micros(reply_delay_us as f32)),
+                wait_for_response: false,
+            },
+        )
+    }
+
+    #[allow(dead_code)]
+    fn send_range_failed<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        destination: ShortAddress,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_range_failed(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            destination,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::RangeFailed);
+        self.last_tx_destination = destination;
+        radio.transmit(&frame[..len], TxOptions::default())
+    }
+
+    fn ensure_peer(
+        &mut self,
+        eui: Option<crate::device::Eui64>,
+        short_address: ShortAddress,
+        now_ms: u32,
+    ) -> Result<&Peer, ProtocolError> {
+        if let Some(index) = self
+            .peers
             .iter()
-            .position(|d| d.short_address == *short_address)
-    }
-
-    fn add_network_device(&mut self, address: [u8; 8], short_address: [u8; 2]) -> bool {
-        if self.search_distant_device(&short_address).is_some() {
-            return false;
-        }
-
-        if self.device_type == DeviceType::Anchor {
-            self.network_devices.clear();
-        }
-
-        let index = self.network_devices.len() as u8;
-        if self
-            .network_devices
-            .push(NetworkDevice::new(address, short_address, index))
-            .is_err()
+            .position(|peer| peer.short_address == short_address)
         {
-            return false;
+            let peer = &mut self.peers[index];
+            peer.last_activity_ms = now_ms;
+            if peer.eui.is_none() {
+                peer.eui = eui;
+            }
+            return Ok(peer);
+        }
+        self.peers
+            .push(Peer::new(eui, short_address))
+            .map_err(|_| ProtocolError::PeerTableFull)?;
+        let last = self.peers.last_mut().ok_or(ProtocolError::PeerTableFull)?;
+        last.last_activity_ms = now_ms;
+        Ok(last)
+    }
+
+    fn peer(&self, short_address: ShortAddress) -> Option<&Peer> {
+        self.peers
+            .iter()
+            .find(|peer| peer.short_address == short_address)
+    }
+
+    fn peer_mut(&mut self, short_address: ShortAddress) -> Option<&mut Peer> {
+        self.peers
+            .iter_mut()
+            .find(|peer| peer.short_address == short_address)
+    }
+
+    fn next_sequence(&mut self) -> u8 {
+        let sequence = self.sequence;
+        self.sequence = self.sequence.wrapping_add(1);
+        sequence
+    }
+
+    fn reset_protocol_state(&mut self) {
+        self.expected = match self.role {
+            Role::Tag => FrameKind::PollAck,
+            Role::Anchor => FrameKind::Poll,
+        };
+        self.last_tx_kind = None;
+        self.last_tx_destination = ShortAddress::BROADCAST;
+        self.poll_acknowledged.clear();
+    }
+}
+
+fn filtered_range(range_filter: Option<u16>, previous: f32, distance: f32) -> f32 {
+    if let Some(filter) = range_filter {
+        if previous != 0.0 {
+            let k = 2.0 / (filter as f32 + 1.0);
+            return distance * k + previous * (1.0 - k);
+        }
+    }
+    distance
+}
+
+#[cfg(test)]
+mod tests {
+    use core::convert::Infallible;
+
+    use super::*;
+    use crate::device::{DeviceIdentity, Eui64, PanId, ShortAddress};
+
+    #[derive(Default)]
+    struct RecordingRadio {
+        receive_calls: Vec<RxOptions, 4>,
+    }
+
+    impl RangingRadio<Infallible, Infallible> for RecordingRadio {
+        fn start_receive(
+            &mut self,
+            options: RxOptions,
+        ) -> Result<(), Error<Infallible, Infallible>> {
+            self.receive_calls.push(options).unwrap();
+            Ok(())
         }
 
-        true
+        fn transmit(
+            &mut self,
+            _frame: &[u8],
+            _options: TxOptions,
+        ) -> Result<(), Error<Infallible, Infallible>> {
+            unreachable!("recover_link does not transmit")
+        }
+
+        fn read_frame<'a>(
+            &mut self,
+            _buffer: &'a mut [u8],
+        ) -> Result<RxFrame<'a>, Error<Infallible, Infallible>> {
+            unreachable!("recover_link does not read frames")
+        }
+
+        fn read_timestamps(&mut self) -> Result<Timestamps, Error<Infallible, Infallible>> {
+            unreachable!("recover_link does not read timestamps")
+        }
+
+        fn compute_delayed_time(
+            &mut self,
+            _delay: DwTime,
+        ) -> Result<DwTime, Error<Infallible, Infallible>> {
+            unreachable!("recover_link does not compute delayed times")
+        }
     }
 
-    fn add_network_device_short(&mut self, short_address: [u8; 2]) -> bool {
-        self.add_network_device([0; 8], short_address)
+    fn identity(short: u16, eui: [u8; 8]) -> DeviceIdentity {
+        DeviceIdentity::new(
+            PanId::new(0xDECA),
+            ShortAddress::new(short),
+            Eui64::new(eui),
+        )
     }
 
-    fn note_activity(&mut self) {
-        self.last_activity = Instant::now();
-    }
+    #[test]
+    fn recover_link_preserves_peers_and_resets_protocol_state() {
+        let mut node = RangingNode::<4>::new(
+            Role::Tag,
+            RangingConfig::new(identity(0x1234, [0, 1, 2, 3, 4, 5, 6, 7])),
+        );
+        let mut radio = RecordingRadio::default();
 
-    fn compute_range_asymmetric_static(
-        time_poll_sent: DW1000Time,
-        time_poll_received: DW1000Time,
-        time_poll_ack_sent: DW1000Time,
-        time_poll_ack_received: DW1000Time,
-        time_range_sent: DW1000Time,
-        time_range_received: DW1000Time,
-    ) -> f32 {
-        let round1 = (time_poll_ack_received - time_poll_sent).wrapped();
-        let reply1 = (time_poll_ack_sent - time_poll_received).wrapped();
-        let round2 = (time_range_received - time_poll_ack_sent).wrapped();
-        let reply2 = (time_range_sent - time_poll_ack_received).wrapped();
+        node.ensure_peer(None, ShortAddress::new(0x4321), 10)
+            .unwrap();
+        node.expected = FrameKind::RangeReport;
+        node.last_activity_ms = 11;
+        node.last_tick_ms = 12;
+        node.last_tx_kind = Some(FrameKind::Range);
+        node.last_tx_destination = ShortAddress::new(0x4321);
+        node.poll_acknowledged
+            .push(ShortAddress::new(0x4321))
+            .unwrap();
 
-        let tof = (round1 * round2 - reply1 * reply2) / (round1 + round2 + reply1 + reply2);
-        tof.as_meters()
-    }
+        node.recover_link(&mut radio, 99).unwrap();
 
-    fn filter_value(value: f32, previous_value: f32, number_of_elements: u16) -> f32 {
-        let k = 2.0 / (number_of_elements as f32 + 1.0);
-        value * k + previous_value * (1.0 - k)
-    }
-
-    fn decode_blink_frame(&self, _address: &mut [u8; 8], _short_address: &mut [u8; 2]) {
-        // Placeholder for MAC frame decoding
-        // Implementation depends on DW1000Mac functionality
-    }
-
-    fn decode_long_mac_frame(&self, _address: &mut [u8; 2]) {
-        // Placeholder for MAC frame decoding
-    }
-
-    fn decode_short_mac_frame(&self, _address: &mut [u8; 2]) {
-        // Placeholder for MAC frame decoding
+        assert_eq!(node.peers.len(), 1);
+        assert_eq!(node.expected, FrameKind::PollAck);
+        assert_eq!(node.last_activity_ms, 99);
+        assert_eq!(node.last_tick_ms, 99);
+        assert_eq!(node.last_tx_kind, None);
+        assert_eq!(node.last_tx_destination, ShortAddress::BROADCAST);
+        assert!(node.poll_acknowledged.is_empty());
+        assert_eq!(
+            radio.receive_calls.as_slice(),
+            &[RxOptions {
+                delayed_time: None,
+                permanent: true,
+            }]
+        );
     }
 }
