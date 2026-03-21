@@ -216,7 +216,7 @@ impl ClockMode {
             _ => ClockMode::Auto,
         }
     }
-    
+
     /// Converts ClockMode to u8
     pub fn to_u8(&self) -> u8 {
         *self as u8
@@ -526,8 +526,8 @@ const fn pac_size_for_preamble(preamble_length: PreambleLength) -> PacSize {
         PreambleLength::Symbols64 | PreambleLength::Symbols128 => PacSize::Symbols8,
         PreambleLength::Symbols256 | PreambleLength::Symbols512 => PacSize::Symbols16,
         PreambleLength::Symbols1024 => PacSize::Symbols32,
-        PreambleLength::Symbols1536
-        | PreambleLength::Symbols2048
-        | PreambleLength::Symbols4096 => PacSize::Symbols64,
+        PreambleLength::Symbols1536 | PreambleLength::Symbols2048 | PreambleLength::Symbols4096 => {
+            PacSize::Symbols64
+        }
     }
 }

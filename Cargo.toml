@@ -11,7 +11,7 @@ categories = ["embedded", "hardware-support", "no-std"]
 
 [dependencies]
 embedded-hal = "1.0.0"
-embassy-time = { version = "0.3.0"}
+embedded-hal-async = "1.0.0"
 defmt = { version = "0.3", optional = true }
 libm = "0.2"
 heapless = "0.9.1"
@@ -19,15 +19,9 @@ rand_core = "0.9.3"
 
 [features]
 default = []
-legacy-examples = []
 
-[[example]]
-name = "anchor"
-required-features = ["legacy-examples"]
-
-[[example]]
-name = "tag"
-required-features = ["legacy-examples"]
+[dev-dependencies]
+futures = "0.3"
 
 # Set the default for dependencies.
 [profile.dev.package."*"]

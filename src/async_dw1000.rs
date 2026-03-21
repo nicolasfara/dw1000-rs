@@ -1,8 +1,8 @@
-//! Core DW1000 driver implementation.
+//! Async DW1000 driver implementation.
 
-use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::{InputPin, OutputPin};
-use embedded_hal::spi::{Operation, SpiDevice};
+use embedded_hal::spi::Operation;
+use embedded_hal_async::{delay::DelayNs, digital::Wait, spi::SpiDevice};
 
 use crate::config::{
     ConfigError, DataRate, PacSize, PreambleCode, PreambleLength, PulseFrequency, RadioConfig,
@@ -32,9 +32,9 @@ use crate::registers::{
 };
 use crate::time::DwTime;
 
-/// Blocking DW1000 driver.
+/// Async DW1000 driver.
 #[derive(Debug)]
-pub struct Dw1000<SPI, IRQ, RST> {
+pub struct AsyncDw1000<SPI, IRQ, RST> {
     spi: SPI,
     irq: IRQ,
     reset: RST,
@@ -47,10 +47,10 @@ pub struct Dw1000<SPI, IRQ, RST> {
     runtime: DriverRuntime,
 }
 
-impl<SPI, IRQ, RST, PinE> Dw1000<SPI, IRQ, RST>
+impl<SPI, IRQ, RST, PinE> AsyncDw1000<SPI, IRQ, RST>
 where
     SPI: SpiDevice,
-    IRQ: InputPin<Error = PinE>,
+    IRQ: InputPin<Error = PinE> + Wait<Error = PinE>,
     RST: OutputPin<Error = PinE>,
 {
     /// Creates a new driver instance.
@@ -70,28 +70,31 @@ where
     }
 
     /// Initializes the DW1000 and applies the supplied configuration.
-    pub fn init(
+    pub async fn init(
         &mut self,
         delay: &mut impl DelayNs,
         config: &RadioConfig,
     ) -> Result<(), Error<SPI::Error, PinE>> {
-        self.hard_reset(delay)?;
-        self.enable_clock(ClockMode::Auto)?;
-        delay.delay_ms(5);
-        self.clear_interrupts()?;
-        self.enable_clock(ClockMode::Xti)?;
-        delay.delay_ms(5);
-        self.manage_lde(delay)?;
-        self.enable_clock(ClockMode::Auto)?;
-        delay.delay_ms(5);
-        self.reconfigure(config)
+        self.hard_reset(delay).await?;
+        self.enable_clock(ClockMode::Auto).await?;
+        delay.delay_ms(5).await;
+        self.clear_interrupts().await?;
+        self.enable_clock(ClockMode::Xti).await?;
+        delay.delay_ms(5).await;
+        self.manage_lde(delay).await?;
+        self.enable_clock(ClockMode::Auto).await?;
+        delay.delay_ms(5).await;
+        self.reconfigure(config).await
     }
 
     /// Applies a new radio configuration without performing a reset.
-    pub fn reconfigure(&mut self, config: &RadioConfig) -> Result<(), Error<SPI::Error, PinE>> {
+    pub async fn reconfigure(
+        &mut self,
+        config: &RadioConfig,
+    ) -> Result<(), Error<SPI::Error, PinE>> {
         let phy = self.runtime.reconfigure(config)?;
 
-        self.idle()?;
+        self.idle().await?;
         self.panadr = [0xFF; LEN_PANADR];
         self.panadr[0..2].copy_from_slice(&config.address.identity.short_address.to_le_bytes());
         self.panadr[2..4].copy_from_slice(&config.address.identity.pan_id.to_le_bytes());
@@ -118,51 +121,64 @@ where
         set_bit(&mut self.sys_mask, 16, true);
         set_bit(&mut self.sys_mask, 3, true);
 
-        self.apply_phy_config(phy)?;
+        self.apply_phy_config(phy).await?;
         let panadr = self.panadr;
-        self.write_register(Register::PanAdr, NO_SUBADDRESS, &panadr)?;
+        self.write_register(Register::PanAdr, NO_SUBADDRESS, &panadr)
+            .await?;
         self.write_register(
             Register::Eui,
             NO_SUBADDRESS,
             &config.address.identity.eui.to_register_bytes(),
-        )?;
+        )
+        .await?;
         let sys_cfg = self.sys_cfg;
         let sys_mask = self.sys_mask;
         let chan_ctrl = self.chan_ctrl;
         let tx_fctrl = self.tx_fctrl;
-        self.write_register(Register::SysCfg, NO_SUBADDRESS, &sys_cfg)?;
-        self.write_register(Register::SysMask, NO_SUBADDRESS, &sys_mask)?;
-        self.write_register(Register::ChanCtrl, NO_SUBADDRESS, &chan_ctrl)?;
-        self.write_register(Register::TxFctrl, NO_SUBADDRESS, &tx_fctrl)?;
-        self.apply_tuning(phy)?;
+        self.write_register(Register::SysCfg, NO_SUBADDRESS, &sys_cfg)
+            .await?;
+        self.write_register(Register::SysMask, NO_SUBADDRESS, &sys_mask)
+            .await?;
+        self.write_register(Register::ChanCtrl, NO_SUBADDRESS, &chan_ctrl)
+            .await?;
+        self.write_register(Register::TxFctrl, NO_SUBADDRESS, &tx_fctrl)
+            .await?;
+        self.apply_tuning(phy).await?;
         let antenna = self.runtime.antenna_delay.to_time_bytes();
-        self.write_register(Register::TxAntd, NO_SUBADDRESS, &antenna[..LEN_TX_ANTD])?;
-        self.write_register(Register::LdeIf, LDE_RXANTD_SUB, &antenna[..LEN_LDE_RXANTD])?;
+        self.write_register(Register::TxAntd, NO_SUBADDRESS, &antenna[..LEN_TX_ANTD])
+            .await?;
+        self.write_register(Register::LdeIf, LDE_RXANTD_SUB, &antenna[..LEN_LDE_RXANTD])
+            .await?;
         Ok(())
     }
 
     /// Starts a receive session.
-    pub fn start_receive(&mut self, options: RxOptions) -> Result<(), Error<SPI::Error, PinE>> {
-        self.idle()?;
-        self.clear_receive_status()?;
+    pub async fn start_receive(
+        &mut self,
+        options: RxOptions,
+    ) -> Result<(), Error<SPI::Error, PinE>> {
+        self.idle().await?;
+        self.clear_receive_status().await?;
         self.sys_ctrl = [0; LEN_SYS_CTRL];
         self.runtime.state = DriverState::Rx;
         self.runtime.permanent_receive = options.permanent;
         self.runtime.rx_after_tx_pending = false;
         if let Some(delay) = options.delayed_time {
-            let future = self.compute_delayed_time(delay)?;
-            self.write_register(Register::DxTime, NO_SUBADDRESS, &future.to_bytes())?;
+            let future = self.compute_delayed_time(delay).await?;
+            self.write_register(Register::DxTime, NO_SUBADDRESS, &future.to_bytes())
+                .await?;
             set_bit(&mut self.sys_ctrl, RXDLYS_BIT, true);
         }
         set_bit(&mut self.sys_ctrl, SFCST_BIT, !self.runtime.frame_check);
         set_bit(&mut self.sys_ctrl, RXENAB_BIT, true);
         let sys_ctrl = self.sys_ctrl;
-        self.write_register(Register::SysCtrl, NO_SUBADDRESS, &sys_ctrl)?;
+        self.write_register(Register::SysCtrl, NO_SUBADDRESS, &sys_ctrl)
+            .await?;
         Ok(())
     }
 
     /// Transmits a frame.
-    pub fn transmit(
+    pub async fn transmit(
         &mut self,
         frame: &[u8],
         options: TxOptions,
@@ -185,14 +201,16 @@ where
             });
         }
 
-        self.idle()?;
-        self.clear_transmit_status()?;
-        self.write_register(Register::TxBuffer, NO_SUBADDRESS, frame)?;
+        self.idle().await?;
+        self.clear_transmit_status().await?;
+        self.write_register(Register::TxBuffer, NO_SUBADDRESS, frame)
+            .await?;
         self.tx_fctrl[0] = (frame_len & 0xFF) as u8;
         self.tx_fctrl[1] &= 0xFC;
         self.tx_fctrl[1] |= ((frame_len >> 8) & 0x03) as u8;
         let tx_fctrl = self.tx_fctrl;
-        self.write_register(Register::TxFctrl, NO_SUBADDRESS, &tx_fctrl)?;
+        self.write_register(Register::TxFctrl, NO_SUBADDRESS, &tx_fctrl)
+            .await?;
 
         self.sys_ctrl = [0; LEN_SYS_CTRL];
         self.runtime.state = DriverState::Tx;
@@ -200,13 +218,15 @@ where
         set_bit(&mut self.sys_ctrl, SFCST_BIT, !self.runtime.frame_check);
         set_bit(&mut self.sys_ctrl, WAIT4RESP_BIT, options.wait_for_response);
         if let Some(delay) = options.delayed_time {
-            let future = self.compute_delayed_time(delay)?;
-            self.write_register(Register::DxTime, NO_SUBADDRESS, &future.to_bytes())?;
+            let future = self.compute_delayed_time(delay).await?;
+            self.write_register(Register::DxTime, NO_SUBADDRESS, &future.to_bytes())
+                .await?;
             set_bit(&mut self.sys_ctrl, TXDLYS_BIT, true);
         }
         set_bit(&mut self.sys_ctrl, TXSTRT_BIT, true);
         let sys_ctrl = self.sys_ctrl;
-        self.write_register(Register::SysCtrl, NO_SUBADDRESS, &sys_ctrl)?;
+        self.write_register(Register::SysCtrl, NO_SUBADDRESS, &sys_ctrl)
+            .await?;
         if !self.runtime.permanent_receive {
             self.runtime.state = DriverState::Idle;
         }
@@ -214,34 +234,35 @@ where
     }
 
     /// Computes the delayed absolute transmit or receive timestamp used by the DW1000.
-    pub fn compute_delayed_time(
+    pub async fn compute_delayed_time(
         &mut self,
         delay: DwTime,
     ) -> Result<DwTime, Error<SPI::Error, PinE>> {
-        let now = self.read_system_timestamp()? + delay;
+        let now = self.read_system_timestamp().await? + delay;
         Ok(self.runtime.compute_delayed_time(now))
     }
 
     /// Reads a received frame into `buffer`.
-    pub fn read_frame<'a>(
+    pub async fn read_frame<'a>(
         &mut self,
         buffer: &'a mut [u8],
     ) -> Result<RxFrame<'a>, Error<SPI::Error, PinE>> {
-        let status = self.read_sys_status()?;
+        let status = self.read_sys_status().await?;
         self.runtime
             .validate_rx_status(status)
             .map_err(Error::Receive)?;
 
-        let needed = self.read_received_length()?;
+        let needed = self.read_received_length().await?;
         if buffer.len() < needed {
             return Err(Error::BufferTooSmall {
                 len: buffer.len(),
                 needed,
             });
         }
-        self.read_register(Register::RxBuffer, NO_SUBADDRESS, &mut buffer[..needed])?;
-        let timestamp = self.read_receive_timestamp()?;
-        let metrics = self.read_signal_metrics()?;
+        self.read_register(Register::RxBuffer, NO_SUBADDRESS, &mut buffer[..needed])
+            .await?;
+        let timestamp = self.read_receive_timestamp().await?;
+        let metrics = self.read_signal_metrics().await?;
         Ok(RxFrame {
             bytes: &buffer[..needed],
             timestamp: self.correct_receive_timestamp(timestamp, metrics.receive_power_dbm),
@@ -251,43 +272,49 @@ where
     }
 
     /// Reads the latest timestamps.
-    pub fn read_timestamps(&mut self) -> Result<Timestamps, Error<SPI::Error, PinE>> {
+    pub async fn read_timestamps(&mut self) -> Result<Timestamps, Error<SPI::Error, PinE>> {
         Ok(Timestamps {
-            tx: self.read_transmit_timestamp()?,
-            rx: self.read_receive_timestamp()?,
-            system: self.read_system_timestamp()?,
+            tx: self.read_transmit_timestamp().await?,
+            rx: self.read_receive_timestamp().await?,
+            system: self.read_system_timestamp().await?,
         })
     }
 
     /// Reads the current receive metrics.
-    pub fn read_signal_metrics(&mut self) -> Result<SignalMetrics, Error<SPI::Error, PinE>> {
+    pub async fn read_signal_metrics(&mut self) -> Result<SignalMetrics, Error<SPI::Error, PinE>> {
         Ok(SignalMetrics {
-            receive_power_dbm: self.read_receive_power()?,
-            first_path_power_dbm: self.read_first_path_power()?,
-            quality: self.read_receive_quality()?,
+            receive_power_dbm: self.read_receive_power().await?,
+            first_path_power_dbm: self.read_first_path_power().await?,
+            quality: self.read_receive_quality().await?,
         })
     }
 
     /// Reads `SYS_STATUS`.
-    pub fn read_sys_status(&mut self) -> Result<SysStatus, Error<SPI::Error, PinE>> {
+    pub async fn read_sys_status(&mut self) -> Result<SysStatus, Error<SPI::Error, PinE>> {
         let mut bytes = [0u8; LEN_SYS_STATUS];
-        self.read_register(Register::SysStatus, NO_SUBADDRESS, &mut bytes)?;
+        self.read_register(Register::SysStatus, NO_SUBADDRESS, &mut bytes)
+            .await?;
         Ok(sys_status_from_bytes(&bytes))
     }
 
     /// Clears the selected `SYS_STATUS` bits.
-    pub fn clear_events(&mut self, event_mask: SysStatus) -> Result<(), Error<SPI::Error, PinE>> {
+    pub async fn clear_events(
+        &mut self,
+        event_mask: SysStatus,
+    ) -> Result<(), Error<SPI::Error, PinE>> {
         self.write_register(
             Register::SysStatus,
             NO_SUBADDRESS,
             &sys_status_to_bytes(event_mask),
-        )?;
+        )
+        .await?;
         let should_restart_receive = self.runtime.should_restart_receive(event_mask);
         if should_restart_receive {
             self.start_receive(RxOptions {
                 delayed_time: None,
                 permanent: true,
-            })?;
+            })
+            .await?;
         }
         Ok(())
     }
@@ -302,16 +329,27 @@ where
         self.irq.is_high().map_err(Error::Pin)
     }
 
-    fn hard_reset(&mut self, delay: &mut impl DelayNs) -> Result<(), Error<SPI::Error, PinE>> {
+    /// Waits until the DW1000 IRQ line is asserted.
+    pub async fn wait_for_irq(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
+        self.irq.wait_for_high().await.map_err(Error::Pin)
+    }
+
+    async fn hard_reset(
+        &mut self,
+        delay: &mut impl DelayNs,
+    ) -> Result<(), Error<SPI::Error, PinE>> {
         self.reset.set_low().map_err(Error::Pin)?;
-        delay.delay_ms(2);
+        delay.delay_ms(2).await;
         self.reset.set_high().map_err(Error::Pin)?;
-        delay.delay_ms(10);
+        delay.delay_ms(10).await;
         Ok(())
     }
 
-    fn apply_phy_config(&mut self, phy: ValidatedPhyConfig) -> Result<(), Error<SPI::Error, PinE>> {
-        self.set_data_rate(phy.data_rate)?;
+    async fn apply_phy_config(
+        &mut self,
+        phy: ValidatedPhyConfig,
+    ) -> Result<(), Error<SPI::Error, PinE>> {
+        self.set_data_rate(phy.data_rate).await?;
         self.set_pulse_frequency(phy.pulse_frequency);
         self.set_preamble_length(phy.preamble_length);
         self.set_channel(phy.channel);
@@ -319,7 +357,7 @@ where
         Ok(())
     }
 
-    fn set_data_rate(&mut self, rate: DataRate) -> Result<(), Error<SPI::Error, PinE>> {
+    async fn set_data_rate(&mut self, rate: DataRate) -> Result<(), Error<SPI::Error, PinE>> {
         self.tx_fctrl[1] &= 0x83;
         self.tx_fctrl[1] |= ((rate as u8) << 5) & 0xFF;
         set_bit(&mut self.sys_cfg, RXM110K_BIT, rate == DataRate::Kbps110);
@@ -331,7 +369,8 @@ where
         set_bit(&mut self.chan_ctrl, DWSFD_BIT, dwsfd);
         set_bit(&mut self.chan_ctrl, TNSSFD_BIT, tnssfd);
         set_bit(&mut self.chan_ctrl, RNSSFD_BIT, rnssfd);
-        self.write_register(Register::UsrSfd, SFD_LENGTH_SUB, &[sfd_len])?;
+        self.write_register(Register::UsrSfd, SFD_LENGTH_SUB, &[sfd_len])
+            .await?;
         Ok(())
     }
 
@@ -359,31 +398,39 @@ where
         self.chan_ctrl[3] = ((code >> 2) & 0x07) | (code << 3);
     }
 
-    fn apply_tuning(&mut self, phy: ValidatedPhyConfig) -> Result<(), Error<SPI::Error, PinE>> {
+    async fn apply_tuning(
+        &mut self,
+        phy: ValidatedPhyConfig,
+    ) -> Result<(), Error<SPI::Error, PinE>> {
         let agc_tune1 = match phy.pulse_frequency {
             PulseFrequency::Mhz16 => 0x8870u16.to_le_bytes(),
             PulseFrequency::Mhz64 => 0x889Bu16.to_le_bytes(),
         };
-        self.write_register(Register::AgcTune, AGC_TUNE1_SUB, &agc_tune1)?;
+        self.write_register(Register::AgcTune, AGC_TUNE1_SUB, &agc_tune1)
+            .await?;
         self.write_register(
             Register::AgcTune,
             AGC_TUNE2_SUB,
             &0x2502_A907u32.to_le_bytes(),
-        )?;
-        self.write_register(Register::AgcTune, AGC_TUNE3_SUB, &0x0035u16.to_le_bytes())?;
+        )
+        .await?;
+        self.write_register(Register::AgcTune, AGC_TUNE3_SUB, &0x0035u16.to_le_bytes())
+            .await?;
 
         let drx_tune0b = match phy.data_rate {
             DataRate::Kbps110 => 0x0016u16,
             DataRate::Kbps850 => 0x0006u16,
             DataRate::Mbps6800 => 0x0001u16,
         };
-        self.write_register(Register::DrxTune, DRX_TUNE0B_SUB, &drx_tune0b.to_le_bytes())?;
+        self.write_register(Register::DrxTune, DRX_TUNE0B_SUB, &drx_tune0b.to_le_bytes())
+            .await?;
 
         let drx_tune1a = match phy.pulse_frequency {
             PulseFrequency::Mhz16 => 0x0087u16,
             PulseFrequency::Mhz64 => 0x008Du16,
         };
-        self.write_register(Register::DrxTune, DRX_TUNE1A_SUB, &drx_tune1a.to_le_bytes())?;
+        self.write_register(Register::DrxTune, DRX_TUNE1A_SUB, &drx_tune1a.to_le_bytes())
+            .await?;
 
         let drx_tune1b: u16 = match (phy.preamble_length, phy.data_rate) {
             (
@@ -396,7 +443,8 @@ where
             (_, DataRate::Kbps850 | DataRate::Mbps6800) => 0x0020,
             _ => return Err(Error::InvalidConfig(ConfigError::UnsupportedPreambleLength)),
         };
-        self.write_register(Register::DrxTune, DRX_TUNE1B_SUB, &drx_tune1b.to_le_bytes())?;
+        self.write_register(Register::DrxTune, DRX_TUNE1B_SUB, &drx_tune1b.to_le_bytes())
+            .await?;
 
         let drx_tune2: u32 = match (phy.pac_size, phy.pulse_frequency) {
             (PacSize::Symbols8, PulseFrequency::Mhz16) => 0x311A_002D,
@@ -408,19 +456,22 @@ where
             (PacSize::Symbols64, PulseFrequency::Mhz16) => 0x371A_011D,
             (PacSize::Symbols64, PulseFrequency::Mhz64) => 0x373B_0296,
         };
-        self.write_register(Register::DrxTune, DRX_TUNE2_SUB, &drx_tune2.to_le_bytes())?;
+        self.write_register(Register::DrxTune, DRX_TUNE2_SUB, &drx_tune2.to_le_bytes())
+            .await?;
 
         let drx_tune4h = match phy.preamble_length {
             PreambleLength::Symbols64 => 0x0010u16,
             _ => 0x0028u16,
         };
-        self.write_register(Register::DrxTune, DRX_TUNE4H_SUB, &drx_tune4h.to_le_bytes())?;
+        self.write_register(Register::DrxTune, DRX_TUNE4H_SUB, &drx_tune4h.to_le_bytes())
+            .await?;
 
         let rf_rxctrlh = match phy.channel {
             crate::config::Channel::Channel4 | crate::config::Channel::Channel7 => [0xBC],
             _ => [0xD8],
         };
-        self.write_register(Register::RfConf, RF_RXCTRLH_SUB, &rf_rxctrlh)?;
+        self.write_register(Register::RfConf, RF_RXCTRLH_SUB, &rf_rxctrlh)
+            .await?;
 
         let rf_txctrl: u32 = match phy.channel {
             crate::config::Channel::Channel1 => 0x0000_5C40,
@@ -430,7 +481,8 @@ where
             crate::config::Channel::Channel5 => 0x001E_3FE0,
             crate::config::Channel::Channel7 => 0x001E_7DE0,
         };
-        self.write_register(Register::RfConf, RF_TXCTRL_SUB, &rf_txctrl.to_le_bytes())?;
+        self.write_register(Register::RfConf, RF_TXCTRL_SUB, &rf_txctrl.to_le_bytes())
+            .await?;
 
         let tc_pgdelay = match phy.channel {
             crate::config::Channel::Channel1 => [0xC9],
@@ -440,7 +492,8 @@ where
             crate::config::Channel::Channel5 => [0xC0],
             crate::config::Channel::Channel7 => [0x93],
         };
-        self.write_register(Register::TxCal, TC_PGDELAY_SUB, &tc_pgdelay)?;
+        self.write_register(Register::TxCal, TC_PGDELAY_SUB, &tc_pgdelay)
+            .await?;
 
         let (fspllcfg, fsplltune) = match phy.channel {
             crate::config::Channel::Channel1 => (0x0900_0407u32, [0x1E]),
@@ -452,52 +505,68 @@ where
                 (0x0800_041Du32, [0xBE])
             }
         };
-        self.write_register(Register::FsCtrl, FS_PLLCFG_SUB, &fspllcfg.to_le_bytes())?;
-        self.write_register(Register::FsCtrl, FS_PLLTUNE_SUB, &fsplltune)?;
+        self.write_register(Register::FsCtrl, FS_PLLCFG_SUB, &fspllcfg.to_le_bytes())
+            .await?;
+        self.write_register(Register::FsCtrl, FS_PLLTUNE_SUB, &fsplltune)
+            .await?;
 
-        self.write_register(Register::LdeIf, LDE_CFG1_SUB, &[0x0D])?;
+        self.write_register(Register::LdeIf, LDE_CFG1_SUB, &[0x0D])
+            .await?;
         let lde_cfg2 = match phy.pulse_frequency {
             PulseFrequency::Mhz16 => 0x1607u16,
             PulseFrequency::Mhz64 => 0x0607u16,
         };
-        self.write_register(Register::LdeIf, LDE_CFG2_SUB, &lde_cfg2.to_le_bytes())?;
+        self.write_register(Register::LdeIf, LDE_CFG2_SUB, &lde_cfg2.to_le_bytes())
+            .await?;
         let lde_repc = lde_repc_value(phy.preamble_code, phy.data_rate);
-        self.write_register(Register::LdeIf, LDE_REPC_SUB, &lde_repc.to_le_bytes())?;
+        self.write_register(Register::LdeIf, LDE_REPC_SUB, &lde_repc.to_le_bytes())
+            .await?;
 
         let tx_power = tx_power_value(phy.channel, phy.pulse_frequency, phy.smart_power);
-        self.write_register(Register::TxPower, NO_SUBADDRESS, &tx_power.to_le_bytes())?;
+        self.write_register(Register::TxPower, NO_SUBADDRESS, &tx_power.to_le_bytes())
+            .await?;
 
-        let xtal_trim = self.read_otp(0x01E)?[0];
+        let xtal_trim = self.read_otp(0x01E).await?[0];
         let fs_xtalt = if xtal_trim == 0 {
             0x70
         } else {
             (xtal_trim & 0x1F) | 0x60
         };
-        self.write_register(Register::FsCtrl, FS_XTALT_SUB, &[fs_xtalt])?;
+        self.write_register(Register::FsCtrl, FS_XTALT_SUB, &[fs_xtalt])
+            .await?;
         Ok(())
     }
 
-    fn manage_lde(&mut self, delay: &mut impl DelayNs) -> Result<(), Error<SPI::Error, PinE>> {
+    async fn manage_lde(
+        &mut self,
+        delay: &mut impl DelayNs,
+    ) -> Result<(), Error<SPI::Error, PinE>> {
         let mut pmsc_ctrl0 = [0u8; LEN_PMSC_CTRL0];
-        self.read_register(Register::Pmsc, PMSC_CTRL0_SUB, &mut pmsc_ctrl0)?;
+        self.read_register(Register::Pmsc, PMSC_CTRL0_SUB, &mut pmsc_ctrl0)
+            .await?;
         let mut otp_ctrl = [0u8; LEN_OTP_CTRL];
-        self.read_register(Register::OtpIf, OTP_CTRL_SUB, &mut otp_ctrl)?;
+        self.read_register(Register::OtpIf, OTP_CTRL_SUB, &mut otp_ctrl)
+            .await?;
         pmsc_ctrl0[0] = 0x01;
         pmsc_ctrl0[1] = 0x03;
         otp_ctrl[0] = 0x00;
         otp_ctrl[1] = 0x80;
-        self.write_register(Register::Pmsc, PMSC_CTRL0_SUB, &pmsc_ctrl0[..2])?;
-        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &otp_ctrl)?;
-        delay.delay_ms(5);
+        self.write_register(Register::Pmsc, PMSC_CTRL0_SUB, &pmsc_ctrl0[..2])
+            .await?;
+        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &otp_ctrl)
+            .await?;
+        delay.delay_ms(5).await;
         pmsc_ctrl0[0] = 0x00;
         pmsc_ctrl0[1] &= 0x02;
-        self.write_register(Register::Pmsc, PMSC_CTRL0_SUB, &pmsc_ctrl0[..2])?;
+        self.write_register(Register::Pmsc, PMSC_CTRL0_SUB, &pmsc_ctrl0[..2])
+            .await?;
         Ok(())
     }
 
-    fn enable_clock(&mut self, mode: ClockMode) -> Result<(), Error<SPI::Error, PinE>> {
+    async fn enable_clock(&mut self, mode: ClockMode) -> Result<(), Error<SPI::Error, PinE>> {
         let mut pmsc_ctrl0 = [0u8; LEN_PMSC_CTRL0];
-        self.read_register(Register::Pmsc, PMSC_CTRL0_SUB, &mut pmsc_ctrl0)?;
+        self.read_register(Register::Pmsc, PMSC_CTRL0_SUB, &mut pmsc_ctrl0)
+            .await?;
         match mode {
             ClockMode::Auto => {
                 pmsc_ctrl0[0] = 0x00;
@@ -509,35 +578,46 @@ where
             }
         }
         self.write_register(Register::Pmsc, PMSC_CTRL0_SUB, &pmsc_ctrl0[..2])
+            .await
     }
 
-    fn read_otp(&mut self, address: u16) -> Result<[u8; LEN_OTP_RDAT], Error<SPI::Error, PinE>> {
+    async fn read_otp(
+        &mut self,
+        address: u16,
+    ) -> Result<[u8; LEN_OTP_RDAT], Error<SPI::Error, PinE>> {
         let mut address_bytes = [0u8; LEN_OTP_ADDR];
         address_bytes.copy_from_slice(&address.to_le_bytes());
-        self.write_register(Register::OtpIf, OTP_ADDR_SUB, &address_bytes)?;
-        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &[0x03])?;
-        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &[0x01])?;
+        self.write_register(Register::OtpIf, OTP_ADDR_SUB, &address_bytes)
+            .await?;
+        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &[0x03])
+            .await?;
+        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &[0x01])
+            .await?;
         let mut data = [0u8; LEN_OTP_RDAT];
-        self.read_register(Register::OtpIf, OTP_RDAT_SUB, &mut data)?;
-        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &[0x00])?;
+        self.read_register(Register::OtpIf, OTP_RDAT_SUB, &mut data)
+            .await?;
+        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &[0x00])
+            .await?;
         Ok(data)
     }
 
-    fn idle(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
+    async fn idle(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
         self.sys_ctrl = [0; LEN_SYS_CTRL];
         set_bit(&mut self.sys_ctrl, TRXOFF_BIT, true);
         self.runtime.state = DriverState::Idle;
         let sys_ctrl = self.sys_ctrl;
         self.write_register(Register::SysCtrl, NO_SUBADDRESS, &sys_ctrl)
+            .await
     }
 
-    fn clear_interrupts(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
+    async fn clear_interrupts(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
         self.sys_mask = [0; LEN_SYS_MASK];
         let sys_mask = self.sys_mask;
         self.write_register(Register::SysMask, NO_SUBADDRESS, &sys_mask)
+            .await
     }
 
-    fn clear_receive_status(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
+    async fn clear_receive_status(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
         let mask = status::RX_FRAME_READY.0
             | status::LDE_DONE.0
             | status::LDE_ERROR.0
@@ -546,53 +626,69 @@ where
             | status::RX_FRAME_GOOD.0
             | status::RX_REED_SOLOMON_ERROR.0
             | status::RX_TIMEOUT.0;
-        self.clear_events(SysStatus(mask))
+        self.write_register(
+            Register::SysStatus,
+            NO_SUBADDRESS,
+            &sys_status_to_bytes(SysStatus(mask)),
+        )
+        .await
     }
 
-    fn clear_transmit_status(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
+    async fn clear_transmit_status(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
         let mask = status::TX_FRAME_BEGIN.0
             | status::TX_PREAMBLE_SENT.0
             | status::TX_HEADER_SENT.0
             | status::TX_FRAME_SENT.0;
-        self.clear_events(SysStatus(mask))
+        self.write_register(
+            Register::SysStatus,
+            NO_SUBADDRESS,
+            &sys_status_to_bytes(SysStatus(mask)),
+        )
+        .await
     }
 
-    fn read_received_length(&mut self) -> Result<usize, Error<SPI::Error, PinE>> {
+    async fn read_received_length(&mut self) -> Result<usize, Error<SPI::Error, PinE>> {
         let mut info = [0u8; LEN_RX_FINFO];
-        self.read_register(Register::RxFinfo, NO_SUBADDRESS, &mut info)?;
+        self.read_register(Register::RxFinfo, NO_SUBADDRESS, &mut info)
+            .await?;
         Ok(self.runtime.rx_payload_len(info))
     }
 
-    fn read_transmit_timestamp(&mut self) -> Result<DwTime, Error<SPI::Error, PinE>> {
+    async fn read_transmit_timestamp(&mut self) -> Result<DwTime, Error<SPI::Error, PinE>> {
         let mut bytes = [0u8; LEN_TX_STAMP];
-        self.read_register(Register::TxTime, TX_STAMP_SUB, &mut bytes)?;
+        self.read_register(Register::TxTime, TX_STAMP_SUB, &mut bytes)
+            .await?;
         Ok(DwTime::from_bytes(&bytes))
     }
 
-    fn read_receive_timestamp(&mut self) -> Result<DwTime, Error<SPI::Error, PinE>> {
+    async fn read_receive_timestamp(&mut self) -> Result<DwTime, Error<SPI::Error, PinE>> {
         let mut bytes = [0u8; LEN_RX_STAMP];
-        self.read_register(Register::RxTime, RX_STAMP_SUB, &mut bytes)?;
+        self.read_register(Register::RxTime, RX_STAMP_SUB, &mut bytes)
+            .await?;
         Ok(DwTime::from_bytes(&bytes))
     }
 
-    fn read_system_timestamp(&mut self) -> Result<DwTime, Error<SPI::Error, PinE>> {
+    async fn read_system_timestamp(&mut self) -> Result<DwTime, Error<SPI::Error, PinE>> {
         let mut bytes = [0u8; LEN_RX_STAMP];
-        self.read_register(Register::SysTime, NO_SUBADDRESS, &mut bytes)?;
+        self.read_register(Register::SysTime, NO_SUBADDRESS, &mut bytes)
+            .await?;
         Ok(DwTime::from_bytes(&bytes))
     }
 
-    fn read_receive_quality(&mut self) -> Result<f32, Error<SPI::Error, PinE>> {
+    async fn read_receive_quality(&mut self) -> Result<f32, Error<SPI::Error, PinE>> {
         let mut noise = [0u8; LEN_STD_NOISE];
         let mut fp2 = [0u8; LEN_FP_AMPL2];
-        self.read_register(Register::RxFqual, STD_NOISE_SUB, &mut noise)?;
-        self.read_register(Register::RxFqual, FP_AMPL2_SUB, &mut fp2)?;
+        self.read_register(Register::RxFqual, STD_NOISE_SUB, &mut noise)
+            .await?;
+        self.read_register(Register::RxFqual, FP_AMPL2_SUB, &mut fp2)
+            .await?;
         Ok(compute_receive_quality(
             u16::from_le_bytes(noise),
             u16::from_le_bytes(fp2),
         ))
     }
 
-    fn read_first_path_power(&mut self) -> Result<f32, Error<SPI::Error, PinE>> {
+    async fn read_first_path_power(&mut self) -> Result<f32, Error<SPI::Error, PinE>> {
         let phy = self
             .runtime
             .phy
@@ -601,10 +697,14 @@ where
         let mut fp2 = [0u8; LEN_FP_AMPL2];
         let mut fp3 = [0u8; LEN_FP_AMPL3];
         let mut info = [0u8; LEN_RX_FINFO];
-        self.read_register(Register::RxTime, FP_AMPL1_SUB, &mut fp1)?;
-        self.read_register(Register::RxFqual, FP_AMPL2_SUB, &mut fp2)?;
-        self.read_register(Register::RxFqual, FP_AMPL3_SUB, &mut fp3)?;
-        self.read_register(Register::RxFinfo, NO_SUBADDRESS, &mut info)?;
+        self.read_register(Register::RxTime, FP_AMPL1_SUB, &mut fp1)
+            .await?;
+        self.read_register(Register::RxFqual, FP_AMPL2_SUB, &mut fp2)
+            .await?;
+        self.read_register(Register::RxFqual, FP_AMPL3_SUB, &mut fp3)
+            .await?;
+        self.read_register(Register::RxFinfo, NO_SUBADDRESS, &mut info)
+            .await?;
         Ok(compute_first_path_power(
             phy,
             u16::from_le_bytes(fp1),
@@ -614,15 +714,17 @@ where
         ))
     }
 
-    fn read_receive_power(&mut self) -> Result<f32, Error<SPI::Error, PinE>> {
+    async fn read_receive_power(&mut self) -> Result<f32, Error<SPI::Error, PinE>> {
         let phy = self
             .runtime
             .phy
             .expect("phy configuration must be available");
         let mut cir = [0u8; LEN_CIR_PWR];
         let mut info = [0u8; LEN_RX_FINFO];
-        self.read_register(Register::RxFqual, CIR_PWR_SUB, &mut cir)?;
-        self.read_register(Register::RxFinfo, NO_SUBADDRESS, &mut info)?;
+        self.read_register(Register::RxFqual, CIR_PWR_SUB, &mut cir)
+            .await?;
+        self.read_register(Register::RxFinfo, NO_SUBADDRESS, &mut info)
+            .await?;
         Ok(compute_receive_power(
             phy,
             u16::from_le_bytes(cir),
@@ -635,7 +737,7 @@ where
             .correct_receive_timestamp(timestamp, receive_power_dbm)
     }
 
-    fn read_register(
+    async fn read_register(
         &mut self,
         register: Register,
         subaddress: u16,
@@ -647,10 +749,13 @@ where
             Operation::Write(&header[..header_len]),
             Operation::Read(buffer),
         ];
-        self.spi.transaction(&mut operations).map_err(Error::Spi)
+        self.spi
+            .transaction(&mut operations)
+            .await
+            .map_err(Error::Spi)
     }
 
-    fn write_register(
+    async fn write_register(
         &mut self,
         register: Register,
         subaddress: u16,
@@ -662,7 +767,10 @@ where
             Operation::Write(&header[..header_len]),
             Operation::Write(data),
         ];
-        self.spi.transaction(&mut operations).map_err(Error::Spi)
+        self.spi
+            .transaction(&mut operations)
+            .await
+            .map_err(Error::Spi)
     }
 }
 

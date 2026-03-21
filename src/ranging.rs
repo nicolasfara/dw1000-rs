@@ -83,6 +83,25 @@ pub trait RangingRadio<SpiE, PinE> {
     fn compute_delayed_time(&mut self, delay: DwTime) -> Result<DwTime, Error<SpiE, PinE>>;
 }
 
+/// Async radio operations required by the ranging node.
+#[allow(async_fn_in_trait)]
+pub trait AsyncRangingRadio<SpiE, PinE> {
+    /// Starts the receiver with the supplied options.
+    async fn start_receive(&mut self, options: RxOptions) -> Result<(), Error<SpiE, PinE>>;
+    /// Transmits a raw frame.
+    async fn transmit(&mut self, frame: &[u8], options: TxOptions)
+        -> Result<(), Error<SpiE, PinE>>;
+    /// Reads an RX frame into the supplied buffer.
+    async fn read_frame<'a>(
+        &mut self,
+        buffer: &'a mut [u8],
+    ) -> Result<RxFrame<'a>, Error<SpiE, PinE>>;
+    /// Reads the latest timestamps.
+    async fn read_timestamps(&mut self) -> Result<Timestamps, Error<SpiE, PinE>>;
+    /// Computes a delayed transmit time relative to now.
+    async fn compute_delayed_time(&mut self, delay: DwTime) -> Result<DwTime, Error<SpiE, PinE>>;
+}
+
 impl<SPI, IRQ, RST, SpiE, PinE> RangingRadio<SpiE, PinE> for crate::dw1000::Dw1000<SPI, IRQ, RST>
 where
     SPI: embedded_hal::spi::SpiDevice<Error = SpiE>,
@@ -107,6 +126,42 @@ where
 
     fn compute_delayed_time(&mut self, delay: DwTime) -> Result<DwTime, Error<SpiE, PinE>> {
         crate::dw1000::Dw1000::compute_delayed_time(self, delay)
+    }
+}
+
+impl<SPI, IRQ, RST, SpiE, PinE> AsyncRangingRadio<SpiE, PinE>
+    for crate::async_dw1000::AsyncDw1000<SPI, IRQ, RST>
+where
+    SPI: embedded_hal_async::spi::SpiDevice<Error = SpiE>,
+    IRQ: embedded_hal::digital::InputPin<Error = PinE>
+        + embedded_hal_async::digital::Wait<Error = PinE>,
+    RST: embedded_hal::digital::OutputPin<Error = PinE>,
+{
+    async fn start_receive(&mut self, options: RxOptions) -> Result<(), Error<SpiE, PinE>> {
+        crate::async_dw1000::AsyncDw1000::start_receive(self, options).await
+    }
+
+    async fn transmit(
+        &mut self,
+        frame: &[u8],
+        options: TxOptions,
+    ) -> Result<(), Error<SpiE, PinE>> {
+        crate::async_dw1000::AsyncDw1000::transmit(self, frame, options).await
+    }
+
+    async fn read_frame<'a>(
+        &mut self,
+        buffer: &'a mut [u8],
+    ) -> Result<RxFrame<'a>, Error<SpiE, PinE>> {
+        crate::async_dw1000::AsyncDw1000::read_frame(self, buffer).await
+    }
+
+    async fn read_timestamps(&mut self) -> Result<Timestamps, Error<SpiE, PinE>> {
+        crate::async_dw1000::AsyncDw1000::read_timestamps(self).await
+    }
+
+    async fn compute_delayed_time(&mut self, delay: DwTime) -> Result<DwTime, Error<SpiE, PinE>> {
+        crate::async_dw1000::AsyncDw1000::compute_delayed_time(self, delay).await
     }
 }
 
@@ -718,6 +773,528 @@ impl<const N: usize> RangingNode<N> {
         self.last_tx_kind = None;
         self.last_tx_destination = ShortAddress::BROADCAST;
         self.poll_acknowledged.clear();
+    }
+}
+
+impl<const N: usize> RangingNode<N> {
+    /// Starts the node and arms permanent receive mode on an async radio.
+    pub async fn start_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        now_ms: u32,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        self.last_activity_ms = now_ms;
+        self.last_tick_ms = now_ms;
+        radio
+            .start_receive(RxOptions {
+                delayed_time: None,
+                permanent: true,
+            })
+            .await
+    }
+
+    /// Resets protocol state and re-arms permanent receive on an async radio.
+    pub async fn recover_link_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        now_ms: u32,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        self.reset_protocol_state();
+        self.last_activity_ms = now_ms;
+        self.last_tick_ms = now_ms;
+        radio
+            .start_receive(RxOptions {
+                delayed_time: None,
+                permanent: true,
+            })
+            .await
+    }
+
+    /// Handles a completed transmission for an async radio.
+    pub async fn on_tx_done_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+    ) -> Result<Option<RangingEvent>, Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        let Some(kind) = self.last_tx_kind else {
+            return Ok(None);
+        };
+        let timestamps = radio.read_timestamps().await?;
+        match (self.role, kind) {
+            (Role::Anchor, FrameKind::PollAck) => {
+                if let Some(peer) = self.peer_mut(self.last_tx_destination) {
+                    peer.poll_ack_sent = timestamps.tx;
+                }
+            }
+            (Role::Tag, FrameKind::Poll) => {
+                if self.last_tx_destination.is_broadcast() {
+                    for peer in self.peers.iter_mut() {
+                        peer.poll_sent = timestamps.tx;
+                    }
+                } else if let Some(peer) = self.peer_mut(self.last_tx_destination) {
+                    peer.poll_sent = timestamps.tx;
+                }
+            }
+            (Role::Tag, FrameKind::Range) => {
+                if self.last_tx_destination.is_broadcast() {
+                    for peer in self.peers.iter_mut() {
+                        peer.range_sent = timestamps.tx;
+                    }
+                } else if let Some(peer) = self.peer_mut(self.last_tx_destination) {
+                    peer.range_sent = timestamps.tx;
+                }
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    /// Handles an incoming frame for an async radio.
+    pub async fn on_rx_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        now_ms: u32,
+        buffer: &mut [u8],
+    ) -> Result<Option<RangingEvent>, Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        let frame = radio.read_frame(buffer).await?;
+        self.last_activity_ms = now_ms;
+        match parse_frame(frame.bytes)? {
+            Frame::Blink(blink) if self.role == Role::Anchor => {
+                self.reset_protocol_state();
+                let peer = self.ensure_peer(Some(blink.source_eui), blink.source_short, now_ms)?;
+                let snapshot = PeerSnapshot::from(peer);
+                self.send_ranging_init_async(radio, blink.source_eui, blink.source_short)
+                    .await?;
+                Ok(Some(RangingEvent::BlinkReceived(snapshot)))
+            }
+            Frame::RangingInit(header) if self.role == Role::Tag => {
+                self.reset_protocol_state();
+                let peer = self.ensure_peer(None, header.source, now_ms)?;
+                Ok(Some(RangingEvent::RangingInitReceived(peer.short_address)))
+            }
+            Frame::Poll { header, payload } if self.role == Role::Anchor => {
+                if self.expected != FrameKind::Poll {
+                    self.reset_protocol_state();
+                }
+                let mut targets = [PollTarget {
+                    short_address: ShortAddress::new(0),
+                    reply_delay_us: 0,
+                }; N];
+                let count = decode_poll_targets(payload, &mut targets)?;
+                let local = self.config.identity.short_address;
+                let Some(target) = targets[..count]
+                    .iter()
+                    .find(|target| target.short_address == local)
+                    .copied()
+                else {
+                    return Ok(None);
+                };
+                let peer = self
+                    .peer_mut(header.source)
+                    .ok_or(ProtocolError::UnknownPeer)?;
+                peer.poll_received = frame.timestamp;
+                peer.last_activity_ms = now_ms;
+                peer.reply_delay_us = target.reply_delay_us;
+                let destination = peer.short_address;
+                self.expected = FrameKind::Range;
+                self.send_poll_ack_async(radio, destination, target.reply_delay_us)
+                    .await?;
+                Ok(None)
+            }
+            Frame::PollAck { header } if self.role == Role::Tag => {
+                if self.expected != FrameKind::PollAck {
+                    self.reset_protocol_state();
+                    return Ok(None);
+                }
+                let short_address = {
+                    let peer = self
+                        .peer_mut(header.source)
+                        .ok_or(ProtocolError::UnknownPeer)?;
+                    peer.poll_ack_received = frame.timestamp;
+                    peer.last_activity_ms = now_ms;
+                    peer.short_address
+                };
+                if !self.poll_acknowledged.contains(&short_address) {
+                    self.poll_acknowledged
+                        .push(short_address)
+                        .map_err(|_| ProtocolError::PeerTableFull)?;
+                }
+                if self.poll_acknowledged.len() == self.peers.len() {
+                    self.expected = FrameKind::RangeReport;
+                    self.send_range_async(radio, None).await?;
+                }
+                Ok(None)
+            }
+            Frame::Range { header, payload } if self.role == Role::Anchor => {
+                if self.expected != FrameKind::Range {
+                    self.reset_protocol_state();
+                    return Ok(None);
+                }
+                let mut timings = [RangeTiming {
+                    short_address: ShortAddress::new(0),
+                    poll_sent: DwTime::zero(),
+                    poll_ack_received: DwTime::zero(),
+                    range_sent: DwTime::zero(),
+                }; N];
+                let count = decode_range_timings(payload, &mut timings)?;
+                let local = self.config.identity.short_address;
+                let Some(timing) = timings[..count]
+                    .iter()
+                    .find(|timing| timing.short_address == local)
+                    .copied()
+                else {
+                    return Ok(None);
+                };
+                self.expected = FrameKind::Poll;
+                let range_filter = self.config.range_filter;
+                let (destination, reply_delay_us, report, snapshot) = {
+                    let peer = self
+                        .peer_mut(header.source)
+                        .ok_or(ProtocolError::UnknownPeer)?;
+                    peer.range_received = frame.timestamp;
+                    peer.poll_sent = timing.poll_sent;
+                    peer.poll_ack_received = timing.poll_ack_received;
+                    peer.range_sent = timing.range_sent;
+                    peer.metrics = frame.metrics;
+                    peer.last_activity_ms = now_ms;
+                    let tof = DwTime::asymmetric_tof(
+                        peer.poll_sent,
+                        peer.poll_received,
+                        peer.poll_ack_sent,
+                        peer.poll_ack_received,
+                        peer.range_sent,
+                        peer.range_received,
+                    );
+                    let distance = filtered_range(range_filter, peer.range_m, tof.as_meters());
+                    peer.range_m = distance;
+                    (
+                        peer.short_address,
+                        peer.reply_delay_us,
+                        RangeReportPayload {
+                            poll_received: peer.poll_received,
+                            poll_ack_sent: peer.poll_ack_sent,
+                            range_received: peer.range_received,
+                            receive_power_dbm: frame.metrics.receive_power_dbm,
+                        },
+                        PeerSnapshot::from(&*peer),
+                    )
+                };
+                self.send_range_report_async(radio, destination, report, reply_delay_us)
+                    .await?;
+                Ok(Some(RangingEvent::RangeUpdated(snapshot)))
+            }
+            Frame::RangeReport { header, payload } if self.role == Role::Tag => {
+                if self.expected != FrameKind::RangeReport {
+                    self.reset_protocol_state();
+                    return Ok(None);
+                }
+                let range_filter = self.config.range_filter;
+                let snapshot = {
+                    let peer = self
+                        .peer_mut(header.source)
+                        .ok_or(ProtocolError::UnknownPeer)?;
+                    let tof = DwTime::asymmetric_tof(
+                        peer.poll_sent,
+                        payload.poll_received,
+                        payload.poll_ack_sent,
+                        peer.poll_ack_received,
+                        peer.range_sent,
+                        payload.range_received,
+                    );
+                    peer.range_m = filtered_range(range_filter, peer.range_m, tof.as_meters());
+                    peer.metrics.receive_power_dbm = payload.receive_power_dbm;
+                    peer.metrics.first_path_power_dbm = frame.metrics.first_path_power_dbm;
+                    peer.metrics.quality = frame.metrics.quality;
+                    peer.last_activity_ms = now_ms;
+                    PeerSnapshot::from(&*peer)
+                };
+                Ok(Some(RangingEvent::RangeUpdated(snapshot)))
+            }
+            Frame::RangeFailed { header } if self.role == Role::Tag => {
+                self.reset_protocol_state();
+                self.peer_mut(header.source)
+                    .ok_or(ProtocolError::UnknownPeer)?
+                    .last_activity_ms = now_ms;
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Periodic maintenance and discovery tick for an async radio.
+    pub async fn tick_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        now_ms: u32,
+    ) -> Result<Option<RangingEvent>, Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        if let Some(position) = self.peers.iter().position(|peer| {
+            now_ms.saturating_sub(peer.last_activity_ms) > self.config.reset_period_ms
+        }) {
+            let short = self.peers.swap_remove(position).short_address;
+            self.reset_protocol_state();
+            return Ok(Some(RangingEvent::PeerInactive(short)));
+        }
+
+        if now_ms.saturating_sub(self.last_tick_ms) < self.config.timer_period_ms {
+            return Ok(None);
+        }
+        self.last_tick_ms = now_ms;
+
+        if self.role == Role::Tag {
+            if !self.peers.is_empty() && self.blink_counter != 0 {
+                self.expected = FrameKind::PollAck;
+                self.poll_acknowledged.clear();
+                self.send_poll_async(radio, None).await?;
+            } else {
+                self.send_blink_async(radio).await?;
+            }
+            self.blink_counter = if self.blink_counter >= 20 {
+                0
+            } else {
+                self.blink_counter + 1
+            };
+        }
+        Ok(None)
+    }
+
+    async fn send_blink_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_discovery_blink(
+            self.next_sequence(),
+            self.config.identity.eui,
+            self.config.identity.short_address,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::Blink);
+        self.last_tx_destination = ShortAddress::BROADCAST;
+        radio.transmit(&frame[..len], TxOptions::default()).await
+    }
+
+    async fn send_ranging_init_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        destination_eui: crate::device::Eui64,
+        destination_short: ShortAddress,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_ranging_init(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            destination_eui,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::RangingInit);
+        self.last_tx_destination = destination_short;
+        radio.transmit(&frame[..len], TxOptions::default()).await
+    }
+
+    async fn send_poll_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        destination: Option<ShortAddress>,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let mut targets = [PollTarget {
+            short_address: ShortAddress::new(0),
+            reply_delay_us: 0,
+        }; N];
+        let destination = destination.unwrap_or(ShortAddress::BROADCAST);
+        let count = if destination.is_broadcast() {
+            for (index, peer) in self.peers.iter_mut().enumerate() {
+                peer.reply_delay_us = ((2 * index + 1) as u16) * self.config.reply_delay_us;
+                targets[index] = PollTarget {
+                    short_address: peer.short_address,
+                    reply_delay_us: peer.reply_delay_us,
+                };
+            }
+            self.peers.len()
+        } else {
+            let reply_delay = self.config.reply_delay_us;
+            let peer = self
+                .peer_mut(destination)
+                .ok_or(ProtocolError::UnknownPeer)?;
+            peer.reply_delay_us = reply_delay;
+            targets[0] = PollTarget {
+                short_address: peer.short_address,
+                reply_delay_us: peer.reply_delay_us,
+            };
+            1
+        };
+        let len = encode_poll(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            destination,
+            &targets[..count],
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::Poll);
+        self.last_tx_destination = destination;
+        radio.transmit(&frame[..len], TxOptions::default()).await
+    }
+
+    async fn send_poll_ack_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        destination: ShortAddress,
+        reply_delay_us: u16,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_poll_ack(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            destination,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::PollAck);
+        self.last_tx_destination = destination;
+        radio
+            .transmit(
+                &frame[..len],
+                TxOptions {
+                    delayed_time: Some(DwTime::from_micros(reply_delay_us as f32)),
+                    wait_for_response: false,
+                },
+            )
+            .await
+    }
+
+    async fn send_range_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        destination: Option<ShortAddress>,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let mut timings = [RangeTiming {
+            short_address: ShortAddress::new(0),
+            poll_sent: DwTime::zero(),
+            poll_ack_received: DwTime::zero(),
+            range_sent: DwTime::zero(),
+        }; N];
+        let destination = destination.unwrap_or(ShortAddress::BROADCAST);
+        let delay = DwTime::from_micros(self.config.reply_delay_us as f32);
+        let range_sent = radio.compute_delayed_time(delay).await?;
+        let count = if destination.is_broadcast() {
+            for (index, peer) in self.peers.iter().enumerate() {
+                timings[index] = RangeTiming {
+                    short_address: peer.short_address,
+                    poll_sent: peer.poll_sent,
+                    poll_ack_received: peer.poll_ack_received,
+                    range_sent,
+                };
+            }
+            self.peers.len()
+        } else {
+            let peer = self.peer(destination).ok_or(ProtocolError::UnknownPeer)?;
+            timings[0] = RangeTiming {
+                short_address: peer.short_address,
+                poll_sent: peer.poll_sent,
+                poll_ack_received: peer.poll_ack_received,
+                range_sent,
+            };
+            1
+        };
+        let len = encode_range(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            destination,
+            &timings[..count],
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::Range);
+        self.last_tx_destination = destination;
+        radio
+            .transmit(
+                &frame[..len],
+                TxOptions {
+                    delayed_time: Some(delay),
+                    wait_for_response: false,
+                },
+            )
+            .await
+    }
+
+    async fn send_range_report_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        destination: ShortAddress,
+        payload: RangeReportPayload,
+        reply_delay_us: u16,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_range_report(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            destination,
+            payload,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::RangeReport);
+        self.last_tx_destination = destination;
+        radio
+            .transmit(
+                &frame[..len],
+                TxOptions {
+                    delayed_time: Some(DwTime::from_micros(reply_delay_us as f32)),
+                    wait_for_response: false,
+                },
+            )
+            .await
+    }
+
+    #[allow(dead_code)]
+    async fn send_range_failed_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        destination: ShortAddress,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_range_failed(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            destination,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::RangeFailed);
+        self.last_tx_destination = destination;
+        radio.transmit(&frame[..len], TxOptions::default()).await
     }
 }
 

@@ -503,13 +503,21 @@ pub const GPIO_MODE: u8 = 0;
 /// LED mode value
 pub const LED_MODE: u8 = 1;
 
+/// First IEEE 802.15.4 frame-control byte used by standard ranging frames.
 pub const FC_1: u8 = 0x41;
+/// First frame-control byte used by DW1000 blink frames.
 pub const FC_1_BLINK: u8 = 0xC5;
+/// Second IEEE 802.15.4 frame-control byte for long addressing.
 pub const FC_2: u8 = 0x8C;
+/// Second IEEE 802.15.4 frame-control byte for short addressing.
 pub const FC_2_SHORT: u8 = 0x88;
 
+/// Little-endian low byte of the default PAN ID.
 pub const PAN_ID_1: u8 = 0xCA;
+/// Little-endian high byte of the default PAN ID.
 pub const PAN_ID_2: u8 = 0xDE;
 
+/// Serialized MAC header length when using short addresses.
 pub const SHORT_MAC_LEN: u8 = 9;
+/// Serialized MAC header length when using extended addresses.
 pub const LONG_MAC_LEN: u8 = 15;
