@@ -25,10 +25,11 @@ use crate::registers::{
     LEN_FP_AMPL2, LEN_FP_AMPL3, LEN_LDE_RXANTD, LEN_OTP_ADDR, LEN_OTP_CTRL, LEN_OTP_RDAT,
     LEN_PANADR, LEN_PMSC_CTRL0, LEN_RX_FINFO, LEN_RX_STAMP, LEN_STD_NOISE, LEN_SYS_CFG,
     LEN_SYS_CTRL, LEN_SYS_MASK, LEN_SYS_STATUS, LEN_TX_ANTD, LEN_TX_FCTRL, LEN_TX_STAMP,
-    NO_SUBADDRESS, OTP_ADDR_SUB, OTP_CTRL_SUB, OTP_RDAT_SUB, PMSC_CTRL0_SUB, RF_RXCTRLH_SUB,
-    RF_TXCTRL_SUB, RNSSFD_BIT, RXAUTR_BIT, RXDLYS_BIT, RXENAB_BIT, RXM110K_BIT, RX_STAMP_SUB,
-    SFCST_BIT, SFD_LENGTH_SUB, STD_NOISE_SUB, TC_PGDELAY_SUB, TNSSFD_BIT, TRXOFF_BIT, TXDLYS_BIT,
-    TXSTRT_BIT, TX_STAMP_SUB, WAIT4RESP_BIT,
+    MLDEERR_BIT, MRXDFR_BIT, MRXFCE_BIT, MRXFCG_BIT, MRXPHE_BIT, MRXFSL_BIT,
+    MTXFRS_BIT, NO_SUBADDRESS, OTP_ADDR_SUB, OTP_CTRL_SUB, OTP_RDAT_SUB, PMSC_CTRL0_SUB,
+    RF_RXCTRLH_SUB, RF_TXCTRL_SUB, RNSSFD_BIT, RXAUTR_BIT, RXDLYS_BIT, RXENAB_BIT, RXM110K_BIT,
+    RX_STAMP_SUB, SFCST_BIT, SFD_LENGTH_SUB, STD_NOISE_SUB, SYS_MASK_BIT3, TC_PGDELAY_SUB,
+    TNSSFD_BIT, TRXOFF_BIT, TXDLYS_BIT, TXSTRT_BIT, TX_STAMP_SUB, WAIT4RESP_BIT,
 };
 use crate::time::DwTime;
 
@@ -112,14 +113,14 @@ where
         set_bit(&mut self.sys_cfg, RXAUTR_BIT, config.receiver_auto_reenable);
         set_bit(&mut self.sys_cfg, DIS_STXP_BIT, !phy.smart_power);
 
-        set_bit(&mut self.sys_mask, 7, true);
-        set_bit(&mut self.sys_mask, 13, true);
-        set_bit(&mut self.sys_mask, 14, true);
-        set_bit(&mut self.sys_mask, 18, true);
-        set_bit(&mut self.sys_mask, 15, true);
-        set_bit(&mut self.sys_mask, 12, true);
-        set_bit(&mut self.sys_mask, 16, true);
-        set_bit(&mut self.sys_mask, 3, true);
+        set_bit(&mut self.sys_mask, MTXFRS_BIT, true);
+        set_bit(&mut self.sys_mask, MRXPHE_BIT, true);
+        set_bit(&mut self.sys_mask, MRXDFR_BIT, true);
+        set_bit(&mut self.sys_mask, MRXFCG_BIT, true);
+        set_bit(&mut self.sys_mask, MRXFCE_BIT, true);
+        set_bit(&mut self.sys_mask, MRXFSL_BIT, true);
+        set_bit(&mut self.sys_mask, MLDEERR_BIT, true);
+        set_bit(&mut self.sys_mask, SYS_MASK_BIT3, true);
 
         self.apply_phy_config(phy).await?;
         let panadr = self.panadr;

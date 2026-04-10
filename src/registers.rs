@@ -195,6 +195,24 @@ pub const WAIT4RESP_BIT: u16 = 7;
 pub const RXENAB_BIT: u16 = 8;
 /// SYS_CTRL bits.
 pub const RXDLYS_BIT: u16 = 9;
+/// SYS_MASK bit: TX frame sent interrupt.
+pub const MTXFRS_BIT: u16 = 7;
+/// SYS_MASK bit 3 (legacy mask setting kept for compatibility).
+pub const SYS_MASK_BIT3: u16 = 3;
+/// SYS_MASK bit: RX frame ready interrupt.
+pub const MRXDFR_BIT: u16 = 13;
+/// SYS_MASK bit: RX frame good (FCS OK) interrupt.
+pub const MRXFCG_BIT: u16 = 14;
+/// SYS_MASK bit: RX frame check error interrupt.
+pub const MRXFCE_BIT: u16 = 15;
+/// SYS_MASK bit: RX Reed-Solomon error interrupt.
+pub const MRXFSL_BIT: u16 = 16;
+/// SYS_MASK bit: RX PHY header error interrupt.
+pub const MRXPHE_BIT: u16 = 12;
+/// SYS_MASK bit: leading-edge detection error interrupt.
+pub const MLDEERR_BIT: u16 = 18;
+/// SYS_MASK bit: receive timeout interrupt.
+pub const MRXRFTO_BIT: u16 = 17;
 /// CHAN_CTRL bits.
 pub const DWSFD_BIT: u16 = 17;
 /// CHAN_CTRL bits.
