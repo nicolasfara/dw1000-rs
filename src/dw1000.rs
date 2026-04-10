@@ -12,7 +12,7 @@ use crate::device::{DeviceIdentity, RxFrame, SignalMetrics, SysStatus, Timestamp
 use crate::driver_core::{
     build_header, compute_first_path_power, compute_receive_power, compute_receive_quality,
     extract_preamble_acc_count, header_len, lde_repc_value, set_bit, tx_power_value, DriverRuntime,
-    DriverState, LEN_EXT_UWB_FRAMES, LEN_UWB_FRAMES,
+    DriverState, LEN_UWB_FRAMES,
 };
 use crate::error::Error;
 use crate::registers::status;
@@ -167,21 +167,16 @@ where
         frame: &[u8],
         options: TxOptions,
     ) -> Result<(), Error<SPI::Error, PinE>> {
+        let max_len = LEN_UWB_FRAMES;
         let frame_len = if self.runtime.frame_check {
             frame.len() + 2
         } else {
             frame.len()
         };
-        if frame_len > LEN_EXT_UWB_FRAMES {
+        if frame_len > max_len {
             return Err(Error::FrameTooLong {
                 len: frame_len,
-                max: LEN_EXT_UWB_FRAMES,
-            });
-        }
-        if frame_len > LEN_UWB_FRAMES {
-            return Err(Error::FrameTooLong {
-                len: frame_len,
-                max: LEN_UWB_FRAMES,
+                max: max_len,
             });
         }
 

@@ -12,7 +12,6 @@ use crate::registers::{Register, LEN_RX_FINFO, NO_SUBADDRESS};
 use crate::time::{DwTime, DISTANCE_PER_TICK_M};
 
 pub(crate) const LEN_UWB_FRAMES: usize = 127;
-pub(crate) const LEN_EXT_UWB_FRAMES: usize = 1023;
 
 const WRITE: u8 = 0x80;
 const WRITE_SUB: u8 = 0xC0;
@@ -233,10 +232,19 @@ pub(crate) const fn header_len(subaddress: u16) -> usize {
 pub(crate) fn set_bit(bytes: &mut [u8], bit: u16, value: bool) {
     let index = (bit / 8) as usize;
     let shift = (bit % 8) as u8;
+    debug_assert!(
+        index < bytes.len(),
+        "bit index {} out of range for {}-byte register",
+        bit,
+        bytes.len()
+    );
+    let Some(byte) = bytes.get_mut(index) else {
+        return;
+    };
     if value {
-        bytes[index] |= 1 << shift;
+        *byte |= 1 << shift;
     } else {
-        bytes[index] &= !(1 << shift);
+        *byte &= !(1 << shift);
     }
 }
 
