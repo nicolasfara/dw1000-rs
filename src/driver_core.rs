@@ -549,6 +549,14 @@ pub(crate) const fn header_len(subaddress: u16) -> usize {
     }
 }
 
+pub(crate) fn compose_gpio_led_mode(gpio_mode: &mut [u8]) {
+    // GPIO2 mode field is bits 10-11, GPIO3 is bits 12-13. LED mode is 0b01.
+    set_bit(gpio_mode, crate::constants::MSGP2 as u16, true);
+    set_bit(gpio_mode, (crate::constants::MSGP2 + 1) as u16, false);
+    set_bit(gpio_mode, crate::constants::MSGP3 as u16, true);
+    set_bit(gpio_mode, (crate::constants::MSGP3 + 1) as u16, false);
+}
+
 pub(crate) fn set_bit(bytes: &mut [u8], bit: u16, value: bool) {
     let index = (bit / 8) as usize;
     let shift = (bit % 8) as u8;

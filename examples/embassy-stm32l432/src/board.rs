@@ -82,7 +82,14 @@ impl Board {
         reset.set_as_input_output(Speed::Low);
 
         let spi_device = ExclusiveDevice::new(spi, cs, Delay).expect("spi device");
-        let radio = AsyncDw1000::new(spi_device, irq, reset);
+        let mut radio = AsyncDw1000::new(spi_device, irq, reset);
+        if radio.enable_leds().await.is_err() {
+            return Err(BoardInitError {
+                orange_led,
+                green_led,
+                message: "failed to enable DW1000 RX/TX leds",
+            });
+        }
 
         Ok(Self {
             radio,

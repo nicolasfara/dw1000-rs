@@ -7,10 +7,11 @@ use embedded_hal::spi::{Operation, SpiDevice};
 use crate::config::{
     RadioConfig, RxOptions, TxOptions, ValidatedPhyConfig,
 };
+use crate::constants::{GPIO_MODE_SUB, LEN_GPIO_MODE};
 use crate::device::{DeviceIdentity, RxFrame, SignalMetrics, SysStatus, Timestamps};
 use crate::driver_core::{
     apply_clock_mode, build_header, cleared_interrupt_mask, compose_base_register_fields,
-    compose_phy_register_fields,
+    compose_gpio_led_mode, compose_phy_register_fields,
     compose_receive_sys_ctrl, compose_transmit_sys_ctrl,
     compute_first_path_power, compute_receive_power, compute_receive_quality,
     extract_preamble_acc_count, header_len, prepare_idle_state, receive_status_clear_mask,
@@ -276,6 +277,16 @@ where
     /// Returns `true` if the IRQ pin is asserted.
     pub fn irq_asserted(&mut self) -> Result<bool, Error<SPI::Error, PinE>> {
         self.irq.is_high().map_err(Error::Pin)
+    }
+
+    /// Enables RX and TX LED indicators on GPIO pins.
+    /// GPIO2 will show RX activity and GPIO3 will show TX activity.
+    pub fn enable_leds(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
+        let mut gpio_mode = [0u8; LEN_GPIO_MODE];
+        self.read_register(Register::GpioCtrl, GPIO_MODE_SUB as u16, &mut gpio_mode)?;
+        compose_gpio_led_mode(&mut gpio_mode);
+        self.write_register(Register::GpioCtrl, GPIO_MODE_SUB as u16, &gpio_mode)?;
+        Ok(())
     }
 
     fn hard_reset(&mut self, delay: &mut impl DelayNs) -> Result<(), Error<SPI::Error, PinE>> {

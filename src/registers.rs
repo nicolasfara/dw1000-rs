@@ -60,6 +60,8 @@ pub enum Register {
     LdeIf = 0x2E,
     /// Power management and system clocking.
     Pmsc = 0x36,
+    /// GPIO control.
+    GpioCtrl = 0x26,
 }
 
 /// Special value meaning "no subaddress".
