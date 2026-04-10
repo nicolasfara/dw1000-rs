@@ -3,15 +3,27 @@
 use libm::{floorf, log10f};
 
 use crate::config::{
-    ConfigError, DataRate, PreambleCode, PulseFrequency, RadioConfig, ValidatedPhyConfig,
+    ConfigError, DataRate, PacSize, PreambleCode, PreambleLength, PulseFrequency, RadioConfig,
+    ValidatedPhyConfig,
 };
 use crate::device::{AntennaDelay, DeviceIdentity, SysStatus};
 use crate::error::RxError;
 use crate::registers::status;
-use crate::registers::{Register, LEN_RX_FINFO, NO_SUBADDRESS};
+use crate::registers::{
+    DIS_DRXB_BIT, DIS_STXP_BIT, DWSFD_BIT, HIRQ_POL_BIT, MLDEERR_BIT, MRXDFR_BIT, MRXFCE_BIT,
+    MRXFCG_BIT, MRXFSL_BIT, MRXPHE_BIT, MTXFRS_BIT, Register, RNSSFD_BIT, RXAUTR_BIT,
+    RXDLYS_BIT, RXENAB_BIT, RXM110K_BIT, SFCST_BIT, SYS_MASK_BIT3, TNSSFD_BIT, TXDLYS_BIT,
+    TRXOFF_BIT, TXSTRT_BIT, WAIT4RESP_BIT, LEN_RX_FINFO, LEN_SYS_MASK, NO_SUBADDRESS,
+};
 use crate::time::{DwTime, DISTANCE_PER_TICK_M};
 
 pub(crate) const LEN_UWB_FRAMES: usize = 127;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClockMode {
+    Auto,
+    Xti,
+}
 
 const WRITE: u8 = 0x80;
 const WRITE_SUB: u8 = 0xC0;
@@ -153,6 +165,113 @@ impl DriverRuntime {
             && matches!(self.state, DriverState::Tx)
             && event_mask.contains(status::TX_FRAME_SENT)
     }
+
+    pub(crate) fn checked_frame_len(&self, payload_len: usize) -> Result<usize, (usize, usize)> {
+        let frame_len = if self.frame_check {
+            payload_len + 2
+        } else {
+            payload_len
+        };
+        if frame_len > LEN_UWB_FRAMES {
+            return Err((frame_len, LEN_UWB_FRAMES));
+        }
+        Ok(frame_len)
+    }
+
+    pub(crate) fn begin_receive_session(&mut self, permanent: bool) {
+        self.state = DriverState::Rx;
+        self.permanent_receive = permanent;
+        self.rx_after_tx_pending = false;
+    }
+
+    pub(crate) fn begin_transmit_session(&mut self) {
+        self.state = DriverState::Tx;
+        self.rx_after_tx_pending = self.permanent_receive;
+    }
+
+    pub(crate) fn complete_transmit_session(&mut self) {
+        if !self.permanent_receive {
+            self.state = DriverState::Idle;
+        }
+    }
+}
+
+pub(crate) fn compose_receive_sys_ctrl(sys_ctrl: &mut [u8], frame_check: bool, delayed: bool) {
+    set_bit(sys_ctrl, SFCST_BIT, !frame_check);
+    set_bit(sys_ctrl, RXENAB_BIT, true);
+    if delayed {
+        set_bit(sys_ctrl, RXDLYS_BIT, true);
+    }
+}
+
+pub(crate) fn compose_transmit_sys_ctrl(
+    sys_ctrl: &mut [u8],
+    frame_check: bool,
+    wait_for_response: bool,
+    delayed: bool,
+) {
+    set_bit(sys_ctrl, SFCST_BIT, !frame_check);
+    set_bit(sys_ctrl, WAIT4RESP_BIT, wait_for_response);
+    if delayed {
+        set_bit(sys_ctrl, TXDLYS_BIT, true);
+    }
+    set_bit(sys_ctrl, TXSTRT_BIT, true);
+}
+
+pub(crate) fn prepare_idle_state(runtime: &mut DriverRuntime, sys_ctrl: &mut [u8]) {
+    set_bit(sys_ctrl, TRXOFF_BIT, true);
+    runtime.state = DriverState::Idle;
+}
+
+pub(crate) const fn cleared_interrupt_mask() -> [u8; LEN_SYS_MASK] {
+    [0; LEN_SYS_MASK]
+}
+
+pub(crate) const fn receive_status_clear_mask() -> SysStatus {
+    SysStatus(
+        status::RX_FRAME_READY.0
+            | status::LDE_DONE.0
+            | status::LDE_ERROR.0
+            | status::RX_HEADER_ERROR.0
+            | status::RX_FRAME_CHECK_ERROR.0
+            | status::RX_FRAME_GOOD.0
+            | status::RX_REED_SOLOMON_ERROR.0
+            | status::RX_TIMEOUT.0,
+    )
+}
+
+pub(crate) const fn transmit_status_clear_mask() -> SysStatus {
+    SysStatus(
+        status::TX_FRAME_BEGIN.0
+            | status::TX_PREAMBLE_SENT.0
+            | status::TX_HEADER_SENT.0
+            | status::TX_FRAME_SENT.0,
+    )
+}
+
+pub(crate) fn set_lde_load_preamble(pmsc_ctrl0: &mut [u8], otp_ctrl: &mut [u8]) {
+    pmsc_ctrl0[0] = 0x01;
+    pmsc_ctrl0[1] = 0x03;
+    otp_ctrl[0] = 0x00;
+    otp_ctrl[1] = 0x80;
+}
+
+pub(crate) fn set_lde_restore_preamble(pmsc_ctrl0: &mut [u8]) {
+    pmsc_ctrl0[0] = 0x00;
+    pmsc_ctrl0[1] &= 0x02;
+}
+
+pub(crate) fn apply_clock_mode(pmsc_ctrl0: &mut [u8], mode: ClockMode) {
+    match mode {
+        ClockMode::Auto => {
+            pmsc_ctrl0[0] = 0x00;
+            pmsc_ctrl0[1] &= 0xFE;
+        }
+        ClockMode::Xti => {
+            pmsc_ctrl0[0] &= 0xFC;
+            pmsc_ctrl0[0] |= 0x01;
+        }
+    }
 }
 
 pub(crate) fn compute_receive_quality(noise: u16, fp2: u16) -> f32 {
@@ -201,6 +320,207 @@ pub(crate) fn compute_receive_power(
 
 pub(crate) fn extract_preamble_acc_count(rx_finfo: [u8; LEN_RX_FINFO]) -> u16 {
     (((rx_finfo[2] as u16) >> 4) & 0xFF) | ((rx_finfo[3] as u16) << 4)
+}
+
+pub(crate) fn compose_base_register_fields(
+    sys_cfg: &mut [u8],
+    sys_mask: &mut [u8],
+    interrupt_polarity_high: bool,
+    receiver_auto_reenable: bool,
+    smart_power: bool,
+) {
+    set_bit(sys_cfg, DIS_DRXB_BIT, true);
+    set_bit(sys_cfg, HIRQ_POL_BIT, interrupt_polarity_high);
+    set_bit(sys_cfg, RXAUTR_BIT, receiver_auto_reenable);
+    set_bit(sys_cfg, DIS_STXP_BIT, !smart_power);
+
+    set_bit(sys_mask, MTXFRS_BIT, true);
+    set_bit(sys_mask, MRXPHE_BIT, true);
+    set_bit(sys_mask, MRXDFR_BIT, true);
+    set_bit(sys_mask, MRXFCG_BIT, true);
+    set_bit(sys_mask, MRXFCE_BIT, true);
+    set_bit(sys_mask, MRXFSL_BIT, true);
+    set_bit(sys_mask, MLDEERR_BIT, true);
+    set_bit(sys_mask, SYS_MASK_BIT3, true);
+}
+
+pub(crate) fn compose_phy_register_fields(
+    sys_cfg: &mut [u8],
+    tx_fctrl: &mut [u8],
+    chan_ctrl: &mut [u8],
+    phy: ValidatedPhyConfig,
+) -> u8 {
+    let sfd_len = compose_data_rate_fields(sys_cfg, tx_fctrl, chan_ctrl, phy.data_rate);
+    compose_pulse_frequency_fields(tx_fctrl, chan_ctrl, phy.pulse_frequency);
+    compose_preamble_length_fields(tx_fctrl, phy.preamble_length);
+    compose_channel_fields(chan_ctrl, phy.channel as u8);
+    compose_preamble_code_fields(chan_ctrl, phy.preamble_code.raw());
+    sfd_len
+}
+
+fn compose_data_rate_fields(
+    sys_cfg: &mut [u8],
+    tx_fctrl: &mut [u8],
+    chan_ctrl: &mut [u8],
+    rate: DataRate,
+) -> u8 {
+    tx_fctrl[1] &= 0x83;
+    tx_fctrl[1] |= (rate as u8) << 5;
+    set_bit(sys_cfg, RXM110K_BIT, rate == DataRate::Kbps110);
+    let (dwsfd, tnssfd, rnssfd, sfd_len) = match rate {
+        DataRate::Mbps6800 => (false, false, false, 0x08),
+        DataRate::Kbps850 => (true, true, true, 0x10),
+        DataRate::Kbps110 => (true, false, false, 0x40),
+    };
+    set_bit(chan_ctrl, DWSFD_BIT, dwsfd);
+    set_bit(chan_ctrl, TNSSFD_BIT, tnssfd);
+    set_bit(chan_ctrl, RNSSFD_BIT, rnssfd);
+    sfd_len
+}
+
+fn compose_pulse_frequency_fields(tx_fctrl: &mut [u8], chan_ctrl: &mut [u8], frequency: PulseFrequency) {
+    tx_fctrl[2] &= 0xFC;
+    tx_fctrl[2] |= frequency as u8;
+    chan_ctrl[2] &= 0xF3;
+    chan_ctrl[2] |= (frequency as u8) << 2;
+}
+
+fn compose_preamble_length_fields(tx_fctrl: &mut [u8], length: crate::config::PreambleLength) {
+    tx_fctrl[2] &= 0xC3;
+    tx_fctrl[2] |= (length as u8) << 2;
+}
+
+fn compose_channel_fields(chan_ctrl: &mut [u8], channel: u8) {
+    chan_ctrl[0] = channel | (channel << 4);
+}
+
+fn compose_preamble_code_fields(chan_ctrl: &mut [u8], code: u8) {
+    chan_ctrl[2] &= 0x3F;
+    chan_ctrl[2] |= code << 6;
+    chan_ctrl[3] = ((code >> 2) & 0x07) | (code << 3);
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TuningValues {
+    pub(crate) agc_tune1: u16,
+    pub(crate) drx_tune0b: u16,
+    pub(crate) drx_tune1a: u16,
+    pub(crate) drx_tune1b: u16,
+    pub(crate) drx_tune2: u32,
+    pub(crate) drx_tune4h: u16,
+    pub(crate) rf_rxctrlh: u8,
+    pub(crate) rf_txctrl: u32,
+    pub(crate) tc_pgdelay: u8,
+    pub(crate) fspllcfg: u32,
+    pub(crate) fsplltune: u8,
+    pub(crate) lde_cfg2: u16,
+    pub(crate) lde_repc: u16,
+    pub(crate) tx_power: u32,
+}
+
+pub(crate) fn select_tuning_values(phy: ValidatedPhyConfig) -> Result<TuningValues, ConfigError> {
+    let agc_tune1 = match phy.pulse_frequency {
+        PulseFrequency::Mhz16 => 0x8870u16,
+        PulseFrequency::Mhz64 => 0x889Bu16,
+    };
+
+    let drx_tune0b = match phy.data_rate {
+        DataRate::Kbps110 => 0x0016u16,
+        DataRate::Kbps850 => 0x0006u16,
+        DataRate::Mbps6800 => 0x0001u16,
+    };
+
+    let drx_tune1a = match phy.pulse_frequency {
+        PulseFrequency::Mhz16 => 0x0087u16,
+        PulseFrequency::Mhz64 => 0x008Du16,
+    };
+
+    let drx_tune1b: u16 = match (phy.preamble_length, phy.data_rate) {
+        (
+            PreambleLength::Symbols1536
+            | PreambleLength::Symbols2048
+            | PreambleLength::Symbols4096,
+            DataRate::Kbps110,
+        ) => 0x0064,
+        (PreambleLength::Symbols64, DataRate::Mbps6800) => 0x0010,
+        (_, DataRate::Kbps850 | DataRate::Mbps6800) => 0x0020,
+        _ => return Err(ConfigError::UnsupportedPreambleLength),
+    };
+
+    let drx_tune2: u32 = match (phy.pac_size, phy.pulse_frequency) {
+        (PacSize::Symbols8, PulseFrequency::Mhz16) => 0x311A_002D,
+        (PacSize::Symbols8, PulseFrequency::Mhz64) => 0x313B_006B,
+        (PacSize::Symbols16, PulseFrequency::Mhz16) => 0x331A_0052,
+        (PacSize::Symbols16, PulseFrequency::Mhz64) => 0x333B_00BE,
+        (PacSize::Symbols32, PulseFrequency::Mhz16) => 0x351A_009A,
+        (PacSize::Symbols32, PulseFrequency::Mhz64) => 0x353B_015E,
+        (PacSize::Symbols64, PulseFrequency::Mhz16) => 0x371A_011D,
+        (PacSize::Symbols64, PulseFrequency::Mhz64) => 0x373B_0296,
+    };
+
+    let drx_tune4h = match phy.preamble_length {
+        PreambleLength::Symbols64 => 0x0010u16,
+        _ => 0x0028u16,
+    };
+
+    let rf_rxctrlh = match phy.channel {
+        crate::config::Channel::Channel4 | crate::config::Channel::Channel7 => 0xBC,
+        _ => 0xD8,
+    };
+
+    let rf_txctrl: u32 = match phy.channel {
+        crate::config::Channel::Channel1 => 0x0000_5C40,
+        crate::config::Channel::Channel2 => 0x0004_5CA0,
+        crate::config::Channel::Channel3 => 0x0008_6CC0,
+        crate::config::Channel::Channel4 => 0x0004_5C80,
+        crate::config::Channel::Channel5 => 0x001E_3FE0,
+        crate::config::Channel::Channel7 => 0x001E_7DE0,
+    };
+
+    let tc_pgdelay = match phy.channel {
+        crate::config::Channel::Channel1 => 0xC9,
+        crate::config::Channel::Channel2 => 0xC2,
+        crate::config::Channel::Channel3 => 0xC5,
+        crate::config::Channel::Channel4 => 0x95,
+        crate::config::Channel::Channel5 => 0xC0,
+        crate::config::Channel::Channel7 => 0x93,
+    };
+
+    let (fspllcfg, fsplltune) = match phy.channel {
+        crate::config::Channel::Channel1 => (0x0900_0407u32, 0x1E),
+        crate::config::Channel::Channel2 | crate::config::Channel::Channel4 => {
+            (0x0840_0508u32, 0x26)
+        }
+        crate::config::Channel::Channel3 => (0x0840_1009u32, 0x56),
+        crate::config::Channel::Channel5 | crate::config::Channel::Channel7 => {
+            (0x0800_041Du32, 0xBE)
+        }
+    };
+
+    let lde_cfg2 = match phy.pulse_frequency {
+        PulseFrequency::Mhz16 => 0x1607u16,
+        PulseFrequency::Mhz64 => 0x0607u16,
+    };
+
+    let lde_repc = lde_repc_value(phy.preamble_code, phy.data_rate);
+    let tx_power = tx_power_value(phy.channel, phy.pulse_frequency, phy.smart_power);
+
+    Ok(TuningValues {
+        agc_tune1,
+        drx_tune0b,
+        drx_tune1a,
+        drx_tune1b,
+        drx_tune2,
+        drx_tune4h,
+        rf_rxctrlh,
+        rf_txctrl,
+        tc_pgdelay,
+        fspllcfg,
+        fsplltune,
+        lde_cfg2,
+        lde_repc,
+        tx_power,
+    })
 }
 
 pub(crate) fn build_header(register: Register, subaddress: u16, write: bool) -> [u8; 3] {

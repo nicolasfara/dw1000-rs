@@ -5,31 +5,30 @@ use embedded_hal::spi::Operation;
 use embedded_hal_async::{delay::DelayNs, digital::Wait, spi::SpiDevice};
 
 use crate::config::{
-    ConfigError, DataRate, PacSize, PreambleCode, PreambleLength, PulseFrequency, RadioConfig,
-    RxOptions, TxOptions, ValidatedPhyConfig,
+    RadioConfig, RxOptions, TxOptions, ValidatedPhyConfig,
 };
 use crate::device::{DeviceIdentity, RxFrame, SignalMetrics, SysStatus, Timestamps};
 use crate::driver_core::{
-    build_header, compute_first_path_power, compute_receive_power, compute_receive_quality,
-    extract_preamble_acc_count, header_len, lde_repc_value, set_bit, tx_power_value, DriverRuntime,
-    DriverState, LEN_UWB_FRAMES,
+    apply_clock_mode, build_header, cleared_interrupt_mask, compose_base_register_fields,
+    compose_phy_register_fields,
+    compose_receive_sys_ctrl, compose_transmit_sys_ctrl,
+    compute_first_path_power, compute_receive_power, compute_receive_quality,
+    extract_preamble_acc_count, header_len, prepare_idle_state, receive_status_clear_mask,
+    select_tuning_values, set_lde_load_preamble, set_lde_restore_preamble,
+    transmit_status_clear_mask, ClockMode, DriverRuntime,
 };
 use crate::error::Error;
-use crate::registers::status;
 use crate::registers::{
     sys_status_from_bytes, sys_status_to_bytes, Register, AGC_TUNE1_SUB, AGC_TUNE2_SUB,
-    AGC_TUNE3_SUB, CIR_PWR_SUB, DIS_DRXB_BIT, DIS_STXP_BIT, DRX_TUNE0B_SUB, DRX_TUNE1A_SUB,
-    DRX_TUNE1B_SUB, DRX_TUNE2_SUB, DRX_TUNE4H_SUB, DWSFD_BIT, FP_AMPL1_SUB, FP_AMPL2_SUB,
-    FP_AMPL3_SUB, FS_PLLCFG_SUB, FS_PLLTUNE_SUB, FS_XTALT_SUB, HIRQ_POL_BIT, LDE_CFG1_SUB,
-    LDE_CFG2_SUB, LDE_REPC_SUB, LDE_RXANTD_SUB, LEN_CHAN_CTRL, LEN_CIR_PWR, LEN_FP_AMPL1,
-    LEN_FP_AMPL2, LEN_FP_AMPL3, LEN_LDE_RXANTD, LEN_OTP_ADDR, LEN_OTP_CTRL, LEN_OTP_RDAT,
-    LEN_PANADR, LEN_PMSC_CTRL0, LEN_RX_FINFO, LEN_RX_STAMP, LEN_STD_NOISE, LEN_SYS_CFG,
-    LEN_SYS_CTRL, LEN_SYS_MASK, LEN_SYS_STATUS, LEN_TX_ANTD, LEN_TX_FCTRL, LEN_TX_STAMP,
-    MLDEERR_BIT, MRXDFR_BIT, MRXFCE_BIT, MRXFCG_BIT, MRXPHE_BIT, MRXFSL_BIT,
-    MTXFRS_BIT, NO_SUBADDRESS, OTP_ADDR_SUB, OTP_CTRL_SUB, OTP_RDAT_SUB, PMSC_CTRL0_SUB,
-    RF_RXCTRLH_SUB, RF_TXCTRL_SUB, RNSSFD_BIT, RXAUTR_BIT, RXDLYS_BIT, RXENAB_BIT, RXM110K_BIT,
-    RX_STAMP_SUB, SFCST_BIT, SFD_LENGTH_SUB, STD_NOISE_SUB, SYS_MASK_BIT3, TC_PGDELAY_SUB,
-    TNSSFD_BIT, TRXOFF_BIT, TXDLYS_BIT, TXSTRT_BIT, TX_STAMP_SUB, WAIT4RESP_BIT,
+    AGC_TUNE3_SUB, CIR_PWR_SUB, DRX_TUNE0B_SUB, DRX_TUNE1A_SUB, DRX_TUNE1B_SUB, DRX_TUNE2_SUB,
+    DRX_TUNE4H_SUB, FP_AMPL1_SUB, FP_AMPL2_SUB, FP_AMPL3_SUB, FS_PLLCFG_SUB, FS_PLLTUNE_SUB,
+    FS_XTALT_SUB, LDE_CFG1_SUB, LDE_CFG2_SUB, LDE_REPC_SUB, LDE_RXANTD_SUB, LEN_CHAN_CTRL,
+    LEN_CIR_PWR, LEN_FP_AMPL1, LEN_FP_AMPL2, LEN_FP_AMPL3, LEN_LDE_RXANTD, LEN_OTP_ADDR,
+    LEN_OTP_CTRL, LEN_OTP_RDAT, LEN_PANADR, LEN_PMSC_CTRL0, LEN_RX_FINFO, LEN_RX_STAMP,
+    LEN_STD_NOISE, LEN_SYS_CFG, LEN_SYS_CTRL, LEN_SYS_MASK, LEN_SYS_STATUS, LEN_TX_ANTD,
+    LEN_TX_FCTRL, LEN_TX_STAMP, NO_SUBADDRESS, OTP_ADDR_SUB, OTP_CTRL_SUB, OTP_RDAT_SUB,
+    PMSC_CTRL0_SUB, RF_RXCTRLH_SUB, RF_TXCTRL_SUB, RX_STAMP_SUB, SFD_LENGTH_SUB,
+    STD_NOISE_SUB, TC_PGDELAY_SUB, TX_STAMP_SUB,
 };
 use crate::time::DwTime;
 
@@ -104,23 +103,13 @@ where
         self.tx_fctrl = [0; LEN_TX_FCTRL];
         self.chan_ctrl = [0; LEN_CHAN_CTRL];
 
-        set_bit(&mut self.sys_cfg, DIS_DRXB_BIT, true);
-        set_bit(
+        compose_base_register_fields(
             &mut self.sys_cfg,
-            HIRQ_POL_BIT,
+            &mut self.sys_mask,
             config.interrupt_polarity_high,
+            config.receiver_auto_reenable,
+            phy.smart_power,
         );
-        set_bit(&mut self.sys_cfg, RXAUTR_BIT, config.receiver_auto_reenable);
-        set_bit(&mut self.sys_cfg, DIS_STXP_BIT, !phy.smart_power);
-
-        set_bit(&mut self.sys_mask, MTXFRS_BIT, true);
-        set_bit(&mut self.sys_mask, MRXPHE_BIT, true);
-        set_bit(&mut self.sys_mask, MRXDFR_BIT, true);
-        set_bit(&mut self.sys_mask, MRXFCG_BIT, true);
-        set_bit(&mut self.sys_mask, MRXFCE_BIT, true);
-        set_bit(&mut self.sys_mask, MRXFSL_BIT, true);
-        set_bit(&mut self.sys_mask, MLDEERR_BIT, true);
-        set_bit(&mut self.sys_mask, SYS_MASK_BIT3, true);
 
         self.apply_phy_config(phy).await?;
         let panadr = self.panadr;
@@ -161,17 +150,17 @@ where
         self.idle().await?;
         self.clear_receive_status().await?;
         self.sys_ctrl = [0; LEN_SYS_CTRL];
-        self.runtime.state = DriverState::Rx;
-        self.runtime.permanent_receive = options.permanent;
-        self.runtime.rx_after_tx_pending = false;
+        self.runtime.begin_receive_session(options.permanent);
         if let Some(delay) = options.delayed_time {
             let future = self.compute_delayed_time(delay).await?;
             self.write_register(Register::DxTime, NO_SUBADDRESS, &future.to_bytes())
                 .await?;
-            set_bit(&mut self.sys_ctrl, RXDLYS_BIT, true);
         }
-        set_bit(&mut self.sys_ctrl, SFCST_BIT, !self.runtime.frame_check);
-        set_bit(&mut self.sys_ctrl, RXENAB_BIT, true);
+        compose_receive_sys_ctrl(
+            &mut self.sys_ctrl,
+            self.runtime.frame_check,
+            options.delayed_time.is_some(),
+        );
         let sys_ctrl = self.sys_ctrl;
         self.write_register(Register::SysCtrl, NO_SUBADDRESS, &sys_ctrl)
             .await?;
@@ -184,18 +173,10 @@ where
         frame: &[u8],
         options: TxOptions,
     ) -> Result<(), Error<SPI::Error, PinE>> {
-        let max_len = LEN_UWB_FRAMES;
-        let frame_len = if self.runtime.frame_check {
-            frame.len() + 2
-        } else {
-            frame.len()
-        };
-        if frame_len > max_len {
-            return Err(Error::FrameTooLong {
-                len: frame_len,
-                max: max_len,
-            });
-        }
+        let frame_len = self
+            .runtime
+            .checked_frame_len(frame.len())
+            .map_err(|(len, max)| Error::FrameTooLong { len, max })?;
 
         self.idle().await?;
         self.clear_transmit_status().await?;
@@ -209,23 +190,22 @@ where
             .await?;
 
         self.sys_ctrl = [0; LEN_SYS_CTRL];
-        self.runtime.state = DriverState::Tx;
-        self.runtime.rx_after_tx_pending = self.runtime.permanent_receive;
-        set_bit(&mut self.sys_ctrl, SFCST_BIT, !self.runtime.frame_check);
-        set_bit(&mut self.sys_ctrl, WAIT4RESP_BIT, options.wait_for_response);
+        self.runtime.begin_transmit_session();
         if let Some(delay) = options.delayed_time {
             let future = self.compute_delayed_time(delay).await?;
             self.write_register(Register::DxTime, NO_SUBADDRESS, &future.to_bytes())
                 .await?;
-            set_bit(&mut self.sys_ctrl, TXDLYS_BIT, true);
         }
-        set_bit(&mut self.sys_ctrl, TXSTRT_BIT, true);
+        compose_transmit_sys_ctrl(
+            &mut self.sys_ctrl,
+            self.runtime.frame_check,
+            options.wait_for_response,
+            options.delayed_time.is_some(),
+        );
         let sys_ctrl = self.sys_ctrl;
         self.write_register(Register::SysCtrl, NO_SUBADDRESS, &sys_ctrl)
             .await?;
-        if !self.runtime.permanent_receive {
-            self.runtime.state = DriverState::Idle;
-        }
+        self.runtime.complete_transmit_session();
         Ok(())
     }
 
@@ -345,64 +325,24 @@ where
         &mut self,
         phy: ValidatedPhyConfig,
     ) -> Result<(), Error<SPI::Error, PinE>> {
-        self.set_data_rate(phy.data_rate).await?;
-        self.set_pulse_frequency(phy.pulse_frequency);
-        self.set_preamble_length(phy.preamble_length);
-        self.set_channel(phy.channel);
-        self.set_preamble_code(phy.preamble_code);
-        Ok(())
-    }
-
-    async fn set_data_rate(&mut self, rate: DataRate) -> Result<(), Error<SPI::Error, PinE>> {
-        self.tx_fctrl[1] &= 0x83;
-        self.tx_fctrl[1] |= ((rate as u8) << 5) & 0xFF;
-        set_bit(&mut self.sys_cfg, RXM110K_BIT, rate == DataRate::Kbps110);
-        let (dwsfd, tnssfd, rnssfd, sfd_len) = match rate {
-            DataRate::Mbps6800 => (false, false, false, 0x08),
-            DataRate::Kbps850 => (true, true, true, 0x10),
-            DataRate::Kbps110 => (true, false, false, 0x40),
-        };
-        set_bit(&mut self.chan_ctrl, DWSFD_BIT, dwsfd);
-        set_bit(&mut self.chan_ctrl, TNSSFD_BIT, tnssfd);
-        set_bit(&mut self.chan_ctrl, RNSSFD_BIT, rnssfd);
+        let sfd_len = compose_phy_register_fields(
+            &mut self.sys_cfg,
+            &mut self.tx_fctrl,
+            &mut self.chan_ctrl,
+            phy,
+        );
         self.write_register(Register::UsrSfd, SFD_LENGTH_SUB, &[sfd_len])
             .await?;
         Ok(())
-    }
-
-    fn set_pulse_frequency(&mut self, frequency: PulseFrequency) {
-        self.tx_fctrl[2] &= 0xFC;
-        self.tx_fctrl[2] |= frequency as u8;
-        self.chan_ctrl[2] &= 0xF3;
-        self.chan_ctrl[2] |= (frequency as u8) << 2;
-    }
-
-    fn set_preamble_length(&mut self, length: PreambleLength) {
-        self.tx_fctrl[2] &= 0xC3;
-        self.tx_fctrl[2] |= (length as u8) << 2;
-    }
-
-    fn set_channel(&mut self, channel: crate::config::Channel) {
-        let channel = channel as u8;
-        self.chan_ctrl[0] = channel | (channel << 4);
-    }
-
-    fn set_preamble_code(&mut self, code: PreambleCode) {
-        let code = code.raw();
-        self.chan_ctrl[2] &= 0x3F;
-        self.chan_ctrl[2] |= code << 6;
-        self.chan_ctrl[3] = ((code >> 2) & 0x07) | (code << 3);
     }
 
     async fn apply_tuning(
         &mut self,
         phy: ValidatedPhyConfig,
     ) -> Result<(), Error<SPI::Error, PinE>> {
-        let agc_tune1 = match phy.pulse_frequency {
-            PulseFrequency::Mhz16 => 0x8870u16.to_le_bytes(),
-            PulseFrequency::Mhz64 => 0x889Bu16.to_le_bytes(),
-        };
-        self.write_register(Register::AgcTune, AGC_TUNE1_SUB, &agc_tune1)
+        let tuning = select_tuning_values(phy).map_err(Error::InvalidConfig)?;
+
+        self.write_register(Register::AgcTune, AGC_TUNE1_SUB, &tuning.agc_tune1.to_le_bytes())
             .await?;
         self.write_register(
             Register::AgcTune,
@@ -413,113 +353,36 @@ where
         self.write_register(Register::AgcTune, AGC_TUNE3_SUB, &0x0035u16.to_le_bytes())
             .await?;
 
-        let drx_tune0b = match phy.data_rate {
-            DataRate::Kbps110 => 0x0016u16,
-            DataRate::Kbps850 => 0x0006u16,
-            DataRate::Mbps6800 => 0x0001u16,
-        };
-        self.write_register(Register::DrxTune, DRX_TUNE0B_SUB, &drx_tune0b.to_le_bytes())
+        self.write_register(Register::DrxTune, DRX_TUNE0B_SUB, &tuning.drx_tune0b.to_le_bytes())
+            .await?;
+        self.write_register(Register::DrxTune, DRX_TUNE1A_SUB, &tuning.drx_tune1a.to_le_bytes())
+            .await?;
+        self.write_register(Register::DrxTune, DRX_TUNE1B_SUB, &tuning.drx_tune1b.to_le_bytes())
+            .await?;
+        self.write_register(Register::DrxTune, DRX_TUNE2_SUB, &tuning.drx_tune2.to_le_bytes())
+            .await?;
+        self.write_register(Register::DrxTune, DRX_TUNE4H_SUB, &tuning.drx_tune4h.to_le_bytes())
             .await?;
 
-        let drx_tune1a = match phy.pulse_frequency {
-            PulseFrequency::Mhz16 => 0x0087u16,
-            PulseFrequency::Mhz64 => 0x008Du16,
-        };
-        self.write_register(Register::DrxTune, DRX_TUNE1A_SUB, &drx_tune1a.to_le_bytes())
+        self.write_register(Register::RfConf, RF_RXCTRLH_SUB, &[tuning.rf_rxctrlh])
+            .await?;
+        self.write_register(Register::RfConf, RF_TXCTRL_SUB, &tuning.rf_txctrl.to_le_bytes())
+            .await?;
+        self.write_register(Register::TxCal, TC_PGDELAY_SUB, &[tuning.tc_pgdelay])
             .await?;
 
-        let drx_tune1b: u16 = match (phy.preamble_length, phy.data_rate) {
-            (
-                PreambleLength::Symbols1536
-                | PreambleLength::Symbols2048
-                | PreambleLength::Symbols4096,
-                DataRate::Kbps110,
-            ) => 0x0064,
-            (PreambleLength::Symbols64, DataRate::Mbps6800) => 0x0010,
-            (_, DataRate::Kbps850 | DataRate::Mbps6800) => 0x0020,
-            _ => return Err(Error::InvalidConfig(ConfigError::UnsupportedPreambleLength)),
-        };
-        self.write_register(Register::DrxTune, DRX_TUNE1B_SUB, &drx_tune1b.to_le_bytes())
+        self.write_register(Register::FsCtrl, FS_PLLCFG_SUB, &tuning.fspllcfg.to_le_bytes())
             .await?;
-
-        let drx_tune2: u32 = match (phy.pac_size, phy.pulse_frequency) {
-            (PacSize::Symbols8, PulseFrequency::Mhz16) => 0x311A_002D,
-            (PacSize::Symbols8, PulseFrequency::Mhz64) => 0x313B_006B,
-            (PacSize::Symbols16, PulseFrequency::Mhz16) => 0x331A_0052,
-            (PacSize::Symbols16, PulseFrequency::Mhz64) => 0x333B_00BE,
-            (PacSize::Symbols32, PulseFrequency::Mhz16) => 0x351A_009A,
-            (PacSize::Symbols32, PulseFrequency::Mhz64) => 0x353B_015E,
-            (PacSize::Symbols64, PulseFrequency::Mhz16) => 0x371A_011D,
-            (PacSize::Symbols64, PulseFrequency::Mhz64) => 0x373B_0296,
-        };
-        self.write_register(Register::DrxTune, DRX_TUNE2_SUB, &drx_tune2.to_le_bytes())
-            .await?;
-
-        let drx_tune4h = match phy.preamble_length {
-            PreambleLength::Symbols64 => 0x0010u16,
-            _ => 0x0028u16,
-        };
-        self.write_register(Register::DrxTune, DRX_TUNE4H_SUB, &drx_tune4h.to_le_bytes())
-            .await?;
-
-        let rf_rxctrlh = match phy.channel {
-            crate::config::Channel::Channel4 | crate::config::Channel::Channel7 => [0xBC],
-            _ => [0xD8],
-        };
-        self.write_register(Register::RfConf, RF_RXCTRLH_SUB, &rf_rxctrlh)
-            .await?;
-
-        let rf_txctrl: u32 = match phy.channel {
-            crate::config::Channel::Channel1 => 0x0000_5C40,
-            crate::config::Channel::Channel2 => 0x0004_5CA0,
-            crate::config::Channel::Channel3 => 0x0008_6CC0,
-            crate::config::Channel::Channel4 => 0x0004_5C80,
-            crate::config::Channel::Channel5 => 0x001E_3FE0,
-            crate::config::Channel::Channel7 => 0x001E_7DE0,
-        };
-        self.write_register(Register::RfConf, RF_TXCTRL_SUB, &rf_txctrl.to_le_bytes())
-            .await?;
-
-        let tc_pgdelay = match phy.channel {
-            crate::config::Channel::Channel1 => [0xC9],
-            crate::config::Channel::Channel2 => [0xC2],
-            crate::config::Channel::Channel3 => [0xC5],
-            crate::config::Channel::Channel4 => [0x95],
-            crate::config::Channel::Channel5 => [0xC0],
-            crate::config::Channel::Channel7 => [0x93],
-        };
-        self.write_register(Register::TxCal, TC_PGDELAY_SUB, &tc_pgdelay)
-            .await?;
-
-        let (fspllcfg, fsplltune) = match phy.channel {
-            crate::config::Channel::Channel1 => (0x0900_0407u32, [0x1E]),
-            crate::config::Channel::Channel2 | crate::config::Channel::Channel4 => {
-                (0x0840_0508u32, [0x26])
-            }
-            crate::config::Channel::Channel3 => (0x0840_1009u32, [0x56]),
-            crate::config::Channel::Channel5 | crate::config::Channel::Channel7 => {
-                (0x0800_041Du32, [0xBE])
-            }
-        };
-        self.write_register(Register::FsCtrl, FS_PLLCFG_SUB, &fspllcfg.to_le_bytes())
-            .await?;
-        self.write_register(Register::FsCtrl, FS_PLLTUNE_SUB, &fsplltune)
+        self.write_register(Register::FsCtrl, FS_PLLTUNE_SUB, &[tuning.fsplltune])
             .await?;
 
         self.write_register(Register::LdeIf, LDE_CFG1_SUB, &[0x0D])
             .await?;
-        let lde_cfg2 = match phy.pulse_frequency {
-            PulseFrequency::Mhz16 => 0x1607u16,
-            PulseFrequency::Mhz64 => 0x0607u16,
-        };
-        self.write_register(Register::LdeIf, LDE_CFG2_SUB, &lde_cfg2.to_le_bytes())
+        self.write_register(Register::LdeIf, LDE_CFG2_SUB, &tuning.lde_cfg2.to_le_bytes())
             .await?;
-        let lde_repc = lde_repc_value(phy.preamble_code, phy.data_rate);
-        self.write_register(Register::LdeIf, LDE_REPC_SUB, &lde_repc.to_le_bytes())
+        self.write_register(Register::LdeIf, LDE_REPC_SUB, &tuning.lde_repc.to_le_bytes())
             .await?;
-
-        let tx_power = tx_power_value(phy.channel, phy.pulse_frequency, phy.smart_power);
-        self.write_register(Register::TxPower, NO_SUBADDRESS, &tx_power.to_le_bytes())
+        self.write_register(Register::TxPower, NO_SUBADDRESS, &tuning.tx_power.to_le_bytes())
             .await?;
 
         let xtal_trim = self.read_otp(0x01E).await?[0];
@@ -543,17 +406,13 @@ where
         let mut otp_ctrl = [0u8; LEN_OTP_CTRL];
         self.read_register(Register::OtpIf, OTP_CTRL_SUB, &mut otp_ctrl)
             .await?;
-        pmsc_ctrl0[0] = 0x01;
-        pmsc_ctrl0[1] = 0x03;
-        otp_ctrl[0] = 0x00;
-        otp_ctrl[1] = 0x80;
+        set_lde_load_preamble(&mut pmsc_ctrl0, &mut otp_ctrl);
         self.write_register(Register::Pmsc, PMSC_CTRL0_SUB, &pmsc_ctrl0[..2])
             .await?;
         self.write_register(Register::OtpIf, OTP_CTRL_SUB, &otp_ctrl)
             .await?;
         delay.delay_ms(5).await;
-        pmsc_ctrl0[0] = 0x00;
-        pmsc_ctrl0[1] &= 0x02;
+        set_lde_restore_preamble(&mut pmsc_ctrl0);
         self.write_register(Register::Pmsc, PMSC_CTRL0_SUB, &pmsc_ctrl0[..2])
             .await?;
         Ok(())
@@ -563,16 +422,7 @@ where
         let mut pmsc_ctrl0 = [0u8; LEN_PMSC_CTRL0];
         self.read_register(Register::Pmsc, PMSC_CTRL0_SUB, &mut pmsc_ctrl0)
             .await?;
-        match mode {
-            ClockMode::Auto => {
-                pmsc_ctrl0[0] = 0x00;
-                pmsc_ctrl0[1] &= 0xFE;
-            }
-            ClockMode::Xti => {
-                pmsc_ctrl0[0] &= 0xFC;
-                pmsc_ctrl0[0] |= 0x01;
-            }
-        }
+        apply_clock_mode(&mut pmsc_ctrl0, mode);
         self.write_register(Register::Pmsc, PMSC_CTRL0_SUB, &pmsc_ctrl0[..2])
             .await
     }
@@ -599,46 +449,33 @@ where
 
     async fn idle(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
         self.sys_ctrl = [0; LEN_SYS_CTRL];
-        set_bit(&mut self.sys_ctrl, TRXOFF_BIT, true);
-        self.runtime.state = DriverState::Idle;
+        prepare_idle_state(&mut self.runtime, &mut self.sys_ctrl);
         let sys_ctrl = self.sys_ctrl;
         self.write_register(Register::SysCtrl, NO_SUBADDRESS, &sys_ctrl)
             .await
     }
 
     async fn clear_interrupts(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
-        self.sys_mask = [0; LEN_SYS_MASK];
+        self.sys_mask = cleared_interrupt_mask();
         let sys_mask = self.sys_mask;
         self.write_register(Register::SysMask, NO_SUBADDRESS, &sys_mask)
             .await
     }
 
     async fn clear_receive_status(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
-        let mask = status::RX_FRAME_READY.0
-            | status::LDE_DONE.0
-            | status::LDE_ERROR.0
-            | status::RX_HEADER_ERROR.0
-            | status::RX_FRAME_CHECK_ERROR.0
-            | status::RX_FRAME_GOOD.0
-            | status::RX_REED_SOLOMON_ERROR.0
-            | status::RX_TIMEOUT.0;
         self.write_register(
             Register::SysStatus,
             NO_SUBADDRESS,
-            &sys_status_to_bytes(SysStatus(mask)),
+            &sys_status_to_bytes(receive_status_clear_mask()),
         )
         .await
     }
 
     async fn clear_transmit_status(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
-        let mask = status::TX_FRAME_BEGIN.0
-            | status::TX_PREAMBLE_SENT.0
-            | status::TX_HEADER_SENT.0
-            | status::TX_FRAME_SENT.0;
         self.write_register(
             Register::SysStatus,
             NO_SUBADDRESS,
-            &sys_status_to_bytes(SysStatus(mask)),
+            &sys_status_to_bytes(transmit_status_clear_mask()),
         )
         .await
     }
@@ -770,8 +607,3 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClockMode {
-    Auto,
-    Xti,
-}
