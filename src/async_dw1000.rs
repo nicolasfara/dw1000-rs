@@ -4,15 +4,13 @@ use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::Operation;
 use embedded_hal_async::{delay::DelayNs, digital::Wait, spi::SpiDevice};
 
-use crate::config::{
-    RadioConfig, RxOptions, TxOptions, ValidatedPhyConfig,
-};
+use crate::config::{RadioConfig, RxOptions, TxOptions, ValidatedPhyConfig};
 use crate::constants::{GPIO_MODE_SUB, LEN_GPIO_MODE};
 use crate::device::{DeviceIdentity, RxFrame, SignalMetrics, SysStatus, Timestamps};
 use crate::driver_core::{
     apply_clock_mode, build_header, cleared_interrupt_mask, compose_base_register_fields,
-    compose_gpio_led_mode, compose_phy_register_fields,
-    compose_receive_sys_ctrl, compose_transmit_sys_ctrl,
+    compose_gpio_led_mode, compose_led_blink_enable, compose_led_clock_enable,
+    compose_phy_register_fields, compose_receive_sys_ctrl, compose_transmit_sys_ctrl,
     compute_first_path_power, compute_receive_power, compute_receive_quality,
     extract_preamble_acc_count, header_len, prepare_idle_state, receive_status_clear_mask,
     select_tuning_values, set_lde_load_preamble, set_lde_restore_preamble,
@@ -25,11 +23,11 @@ use crate::registers::{
     DRX_TUNE4H_SUB, FP_AMPL1_SUB, FP_AMPL2_SUB, FP_AMPL3_SUB, FS_PLLCFG_SUB, FS_PLLTUNE_SUB,
     FS_XTALT_SUB, LDE_CFG1_SUB, LDE_CFG2_SUB, LDE_REPC_SUB, LDE_RXANTD_SUB, LEN_CHAN_CTRL,
     LEN_CIR_PWR, LEN_FP_AMPL1, LEN_FP_AMPL2, LEN_FP_AMPL3, LEN_LDE_RXANTD, LEN_OTP_ADDR,
-    LEN_OTP_CTRL, LEN_OTP_RDAT, LEN_PANADR, LEN_PMSC_CTRL0, LEN_RX_FINFO, LEN_RX_STAMP,
-    LEN_STD_NOISE, LEN_SYS_CFG, LEN_SYS_CTRL, LEN_SYS_MASK, LEN_SYS_STATUS, LEN_TX_ANTD,
-    LEN_TX_FCTRL, LEN_TX_STAMP, NO_SUBADDRESS, OTP_ADDR_SUB, OTP_CTRL_SUB, OTP_RDAT_SUB,
-    PMSC_CTRL0_SUB, RF_RXCTRLH_SUB, RF_TXCTRL_SUB, RX_STAMP_SUB, SFD_LENGTH_SUB,
-    STD_NOISE_SUB, TC_PGDELAY_SUB, TX_STAMP_SUB,
+    LEN_OTP_CTRL, LEN_OTP_RDAT, LEN_PANADR, LEN_PMSC_CTRL0, LEN_PMSC_LEDC, LEN_RX_FINFO,
+    LEN_RX_STAMP, LEN_STD_NOISE, LEN_SYS_CFG, LEN_SYS_CTRL, LEN_SYS_MASK, LEN_SYS_STATUS,
+    LEN_TX_ANTD, LEN_TX_FCTRL, LEN_TX_STAMP, NO_SUBADDRESS, OTP_ADDR_SUB, OTP_CTRL_SUB,
+    OTP_RDAT_SUB, PMSC_CTRL0_SUB, PMSC_LEDC_SUB, RF_RXCTRLH_SUB, RF_TXCTRL_SUB, RX_STAMP_SUB,
+    SFD_LENGTH_SUB, STD_NOISE_SUB, TC_PGDELAY_SUB, TX_STAMP_SUB,
 };
 use crate::time::DwTime;
 
@@ -314,6 +312,20 @@ where
     /// Enables RX and TX LED indicators on GPIO pins.
     /// GPIO2 will show RX activity and GPIO3 will show TX activity.
     pub async fn enable_leds(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
+        let mut pmsc_ctrl0 = [0u8; LEN_PMSC_CTRL0];
+        self.read_register(Register::Pmsc, PMSC_CTRL0_SUB, &mut pmsc_ctrl0)
+            .await?;
+        compose_led_clock_enable(&mut pmsc_ctrl0);
+        self.write_register(Register::Pmsc, PMSC_CTRL0_SUB, &pmsc_ctrl0)
+            .await?;
+
+        let mut pmsc_ledc = [0u8; LEN_PMSC_LEDC];
+        self.read_register(Register::Pmsc, PMSC_LEDC_SUB, &mut pmsc_ledc)
+            .await?;
+        compose_led_blink_enable(&mut pmsc_ledc, 0x20);
+        self.write_register(Register::Pmsc, PMSC_LEDC_SUB, &pmsc_ledc)
+            .await?;
+
         let mut gpio_mode = [0u8; LEN_GPIO_MODE];
         self.read_register(Register::GpioCtrl, GPIO_MODE_SUB as u16, &mut gpio_mode)
             .await?;
@@ -355,8 +367,12 @@ where
     ) -> Result<(), Error<SPI::Error, PinE>> {
         let tuning = select_tuning_values(phy).map_err(Error::InvalidConfig)?;
 
-        self.write_register(Register::AgcTune, AGC_TUNE1_SUB, &tuning.agc_tune1.to_le_bytes())
-            .await?;
+        self.write_register(
+            Register::AgcTune,
+            AGC_TUNE1_SUB,
+            &tuning.agc_tune1.to_le_bytes(),
+        )
+        .await?;
         self.write_register(
             Register::AgcTune,
             AGC_TUNE2_SUB,
@@ -366,37 +382,77 @@ where
         self.write_register(Register::AgcTune, AGC_TUNE3_SUB, &0x0035u16.to_le_bytes())
             .await?;
 
-        self.write_register(Register::DrxTune, DRX_TUNE0B_SUB, &tuning.drx_tune0b.to_le_bytes())
-            .await?;
-        self.write_register(Register::DrxTune, DRX_TUNE1A_SUB, &tuning.drx_tune1a.to_le_bytes())
-            .await?;
-        self.write_register(Register::DrxTune, DRX_TUNE1B_SUB, &tuning.drx_tune1b.to_le_bytes())
-            .await?;
-        self.write_register(Register::DrxTune, DRX_TUNE2_SUB, &tuning.drx_tune2.to_le_bytes())
-            .await?;
-        self.write_register(Register::DrxTune, DRX_TUNE4H_SUB, &tuning.drx_tune4h.to_le_bytes())
-            .await?;
+        self.write_register(
+            Register::DrxTune,
+            DRX_TUNE0B_SUB,
+            &tuning.drx_tune0b.to_le_bytes(),
+        )
+        .await?;
+        self.write_register(
+            Register::DrxTune,
+            DRX_TUNE1A_SUB,
+            &tuning.drx_tune1a.to_le_bytes(),
+        )
+        .await?;
+        self.write_register(
+            Register::DrxTune,
+            DRX_TUNE1B_SUB,
+            &tuning.drx_tune1b.to_le_bytes(),
+        )
+        .await?;
+        self.write_register(
+            Register::DrxTune,
+            DRX_TUNE2_SUB,
+            &tuning.drx_tune2.to_le_bytes(),
+        )
+        .await?;
+        self.write_register(
+            Register::DrxTune,
+            DRX_TUNE4H_SUB,
+            &tuning.drx_tune4h.to_le_bytes(),
+        )
+        .await?;
 
         self.write_register(Register::RfConf, RF_RXCTRLH_SUB, &[tuning.rf_rxctrlh])
             .await?;
-        self.write_register(Register::RfConf, RF_TXCTRL_SUB, &tuning.rf_txctrl.to_le_bytes())
-            .await?;
+        self.write_register(
+            Register::RfConf,
+            RF_TXCTRL_SUB,
+            &tuning.rf_txctrl.to_le_bytes(),
+        )
+        .await?;
         self.write_register(Register::TxCal, TC_PGDELAY_SUB, &[tuning.tc_pgdelay])
             .await?;
 
-        self.write_register(Register::FsCtrl, FS_PLLCFG_SUB, &tuning.fspllcfg.to_le_bytes())
-            .await?;
+        self.write_register(
+            Register::FsCtrl,
+            FS_PLLCFG_SUB,
+            &tuning.fspllcfg.to_le_bytes(),
+        )
+        .await?;
         self.write_register(Register::FsCtrl, FS_PLLTUNE_SUB, &[tuning.fsplltune])
             .await?;
 
         self.write_register(Register::LdeIf, LDE_CFG1_SUB, &[0x0D])
             .await?;
-        self.write_register(Register::LdeIf, LDE_CFG2_SUB, &tuning.lde_cfg2.to_le_bytes())
-            .await?;
-        self.write_register(Register::LdeIf, LDE_REPC_SUB, &tuning.lde_repc.to_le_bytes())
-            .await?;
-        self.write_register(Register::TxPower, NO_SUBADDRESS, &tuning.tx_power.to_le_bytes())
-            .await?;
+        self.write_register(
+            Register::LdeIf,
+            LDE_CFG2_SUB,
+            &tuning.lde_cfg2.to_le_bytes(),
+        )
+        .await?;
+        self.write_register(
+            Register::LdeIf,
+            LDE_REPC_SUB,
+            &tuning.lde_repc.to_le_bytes(),
+        )
+        .await?;
+        self.write_register(
+            Register::TxPower,
+            NO_SUBADDRESS,
+            &tuning.tx_power.to_le_bytes(),
+        )
+        .await?;
 
         let xtal_trim = self.read_otp(0x01E).await?[0];
         let fs_xtalt = if xtal_trim == 0 {
@@ -619,4 +675,3 @@ where
             .map_err(Error::Spi)
     }
 }
-

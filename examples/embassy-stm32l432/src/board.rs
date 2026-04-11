@@ -82,17 +82,8 @@ impl Board {
         reset.set_as_input_output(Speed::Low);
 
         let spi_device = ExclusiveDevice::new(spi, cs, Delay).expect("spi device");
-        let mut radio = AsyncDw1000::new(spi_device, irq, reset);
-        if radio.enable_leds().await.is_err() {
-            return Err(BoardInitError {
-                orange_led,
-                green_led,
-                message: "failed to enable DW1000 RX/TX leds",
-            });
-        }
-
         Ok(Self {
-            radio,
+            radio: AsyncDw1000::new(spi_device, irq, reset),
             orange_led,
             green_led,
         })
@@ -125,6 +116,9 @@ impl Board {
         warn!("recovering radio: {=str}", reason);
         if self.radio.init(&mut Delay, radio_config).await.is_err() {
             self.fault_loop("radio reinit failed").await;
+        }
+        if self.radio.enable_leds().await.is_err() {
+            self.fault_loop("failed to re-enable DW1000 RX/TX leds").await;
         }
         if node.recover_link_async(&mut self.radio, now_ms).await.is_err() {
             self.fault_loop("link recovery failed").await;

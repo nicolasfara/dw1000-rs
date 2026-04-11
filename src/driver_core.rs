@@ -10,10 +10,10 @@ use crate::device::{AntennaDelay, DeviceIdentity, SysStatus};
 use crate::error::RxError;
 use crate::registers::status;
 use crate::registers::{
-    DIS_DRXB_BIT, DIS_STXP_BIT, DWSFD_BIT, HIRQ_POL_BIT, MLDEERR_BIT, MRXDFR_BIT, MRXFCE_BIT,
-    MRXFCG_BIT, MRXFSL_BIT, MRXPHE_BIT, MTXFRS_BIT, Register, RNSSFD_BIT, RXAUTR_BIT,
-    RXDLYS_BIT, RXENAB_BIT, RXM110K_BIT, SFCST_BIT, SYS_MASK_BIT3, TNSSFD_BIT, TXDLYS_BIT,
-    TRXOFF_BIT, TXSTRT_BIT, WAIT4RESP_BIT, LEN_RX_FINFO, LEN_SYS_MASK, NO_SUBADDRESS,
+    Register, DIS_DRXB_BIT, DIS_STXP_BIT, DWSFD_BIT, HIRQ_POL_BIT, LEN_RX_FINFO, LEN_SYS_MASK,
+    MLDEERR_BIT, MRXDFR_BIT, MRXFCE_BIT, MRXFCG_BIT, MRXFSL_BIT, MRXPHE_BIT, MTXFRS_BIT,
+    NO_SUBADDRESS, RNSSFD_BIT, RXAUTR_BIT, RXDLYS_BIT, RXENAB_BIT, RXM110K_BIT, SFCST_BIT,
+    SYS_MASK_BIT3, TNSSFD_BIT, TRXOFF_BIT, TXDLYS_BIT, TXSTRT_BIT, WAIT4RESP_BIT,
 };
 use crate::time::{DwTime, DISTANCE_PER_TICK_M};
 
@@ -378,7 +378,11 @@ fn compose_data_rate_fields(
     sfd_len
 }
 
-fn compose_pulse_frequency_fields(tx_fctrl: &mut [u8], chan_ctrl: &mut [u8], frequency: PulseFrequency) {
+fn compose_pulse_frequency_fields(
+    tx_fctrl: &mut [u8],
+    chan_ctrl: &mut [u8],
+    frequency: PulseFrequency,
+) {
     tx_fctrl[2] &= 0xFC;
     tx_fctrl[2] |= frequency as u8;
     chan_ctrl[2] &= 0xF3;
@@ -437,9 +441,7 @@ pub(crate) fn select_tuning_values(phy: ValidatedPhyConfig) -> Result<TuningValu
 
     let drx_tune1b: u16 = match (phy.preamble_length, phy.data_rate) {
         (
-            PreambleLength::Symbols1536
-            | PreambleLength::Symbols2048
-            | PreambleLength::Symbols4096,
+            PreambleLength::Symbols1536 | PreambleLength::Symbols2048 | PreambleLength::Symbols4096,
             DataRate::Kbps110,
         ) => 0x0064,
         (PreambleLength::Symbols64, DataRate::Mbps6800) => 0x0010,
@@ -550,11 +552,37 @@ pub(crate) const fn header_len(subaddress: u16) -> usize {
 }
 
 pub(crate) fn compose_gpio_led_mode(gpio_mode: &mut [u8]) {
-    // GPIO2 mode field is bits 10-11, GPIO3 is bits 12-13. LED mode is 0b01.
-    set_bit(gpio_mode, crate::constants::MSGP2 as u16, true);
-    set_bit(gpio_mode, (crate::constants::MSGP2 + 1) as u16, false);
-    set_bit(gpio_mode, crate::constants::MSGP3 as u16, true);
-    set_bit(gpio_mode, (crate::constants::MSGP3 + 1) as u16, false);
+    // Keep RXOKLED/SFDLED disabled and only route RXLED/TXLED to GPIO2/GPIO3.
+    set_gpio_message_mode(
+        gpio_mode,
+        crate::constants::MSGP0 as u16,
+        crate::constants::GPIO_MODE,
+    );
+    set_gpio_message_mode(
+        gpio_mode,
+        crate::constants::MSGP1 as u16,
+        crate::constants::GPIO_MODE,
+    );
+    set_gpio_message_mode(
+        gpio_mode,
+        crate::constants::MSGP2 as u16,
+        crate::constants::LED_MODE,
+    );
+    set_gpio_message_mode(
+        gpio_mode,
+        crate::constants::MSGP3 as u16,
+        crate::constants::LED_MODE,
+    );
+}
+
+pub(crate) fn compose_led_clock_enable(pmsc_ctrl0: &mut [u8]) {
+    set_bit(pmsc_ctrl0, crate::constants::GPDCE_BIT as u16, true);
+    set_bit(pmsc_ctrl0, crate::constants::KHZCLKEN_BIT as u16, true);
+}
+
+pub(crate) fn compose_led_blink_enable(pmsc_ledc: &mut [u8], blink_time: u8) {
+    pmsc_ledc[0] = blink_time;
+    set_bit(pmsc_ledc, crate::constants::BLNKEN as u16, true);
 }
 
 pub(crate) fn set_bit(bytes: &mut [u8], bit: u16, value: bool) {
@@ -574,6 +602,11 @@ pub(crate) fn set_bit(bytes: &mut [u8], bit: u16, value: bool) {
     } else {
         *byte &= !(1 << shift);
     }
+}
+
+fn set_gpio_message_mode(gpio_mode: &mut [u8], lsb_bit: u16, mode: u8) {
+    set_bit(gpio_mode, lsb_bit, (mode & 0x01) != 0);
+    set_bit(gpio_mode, lsb_bit + 1, (mode & 0x02) != 0);
 }
 
 pub(crate) fn lde_repc_value(code: PreambleCode, rate: DataRate) -> u16 {
@@ -699,5 +732,22 @@ mod tests {
             runtime.correct_receive_timestamp(timestamp, f32::NAN),
             timestamp
         );
+    }
+
+    #[test]
+    fn compose_led_configuration_sets_required_bits() {
+        let mut gpio_mode = [0xFFu8; 4];
+        super::compose_gpio_led_mode(&mut gpio_mode);
+        assert_eq!(gpio_mode[0] & 0b1100_0000, 0b0000_0000);
+        assert_eq!(gpio_mode[1] & 0b0011_1111, 0b0001_0100);
+
+        let mut pmsc_ctrl0 = [0u8; 4];
+        super::compose_led_clock_enable(&mut pmsc_ctrl0);
+        assert_eq!(pmsc_ctrl0[2] & 0b1000_0100, 0b1000_0100);
+
+        let mut pmsc_ledc = [0u8; 4];
+        super::compose_led_blink_enable(&mut pmsc_ledc, 0x20);
+        assert_eq!(pmsc_ledc[0], 0x20);
+        assert_eq!(pmsc_ledc[1] & 0x01, 0x01);
     }
 }

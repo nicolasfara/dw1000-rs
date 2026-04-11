@@ -101,6 +101,8 @@ pub const LEN_FP_AMPL2: usize = 2;
 pub const LEN_FP_AMPL3: usize = 2;
 /// PMSC control field length.
 pub const LEN_PMSC_CTRL0: usize = 4;
+/// PMSC LED control field length.
+pub const LEN_PMSC_LEDC: usize = 4;
 /// OTP address field length.
 pub const LEN_OTP_ADDR: usize = 2;
 /// OTP control field length.
@@ -128,6 +130,8 @@ pub const FP_AMPL3_SUB: u16 = 0x04;
 pub const CIR_PWR_SUB: u16 = 0x06;
 /// PMSC control 0 subaddress.
 pub const PMSC_CTRL0_SUB: u16 = 0x00;
+/// PMSC LED control subaddress.
+pub const PMSC_LEDC_SUB: u16 = 0x28;
 /// OTP address subaddress.
 pub const OTP_ADDR_SUB: u16 = 0x04;
 /// OTP control subaddress.

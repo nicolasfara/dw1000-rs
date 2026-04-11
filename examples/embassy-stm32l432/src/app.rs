@@ -69,6 +69,12 @@ impl<const N: usize> RangingApp<N> {
                 message: "dw1000 init failed",
             });
         }
+        if board.radio.enable_leds().await.is_err() {
+            return Err(AppInitError {
+                board,
+                message: "failed to enable DW1000 RX/TX leds",
+            });
+        }
         let now = now_ms();
         if node.start_async(&mut board.radio, now).await.is_err() {
             return Err(AppInitError {
