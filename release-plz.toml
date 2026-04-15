@@ -1,0 +1,8 @@
+[workspace]
+release_always = false
+pr_labels = ["release"]
+publish_timeout = "10m"
+repo_url = "https://github.com/nicolasfara/dw1000-rs"
+
+[changelog]
+protect_breaking_commits = true
