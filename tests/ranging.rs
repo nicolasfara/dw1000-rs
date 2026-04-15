@@ -1,4 +1,8 @@
-use std::collections::VecDeque;
+#![allow(missing_docs)]
+
+extern crate alloc;
+
+use alloc::collections::VecDeque;
 
 use dw1000_rs::protocol::{detect_frame_kind, FrameKind};
 use dw1000_rs::ranging::RangingRadio;

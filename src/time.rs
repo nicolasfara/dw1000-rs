@@ -11,19 +11,19 @@ use defmt::Format;
 
 /// Time resolution in microseconds of time-based registers/values.
 /// Each bit in a timestamp counts for a period of approx. 15.65ps
-pub const TIME_RES: f32 = 0.000015650040064103;
+pub const TIME_RES: f32 = 0.000_015_650_041;
 
 /// Inverse of TIME_RES for faster multiplication instead of division
 pub const TIME_RES_INV: f32 = 63897.6;
 
 /// Speed of radio waves [m/s] * timestamp resolution [~15.65ps] of DW1000
-pub const DISTANCE_OF_RADIO: f32 = 0.0046917639786159;
+pub const DISTANCE_OF_RADIO: f32 = 0.004_691_764;
 
 /// Distance represented by one DW1000 timestamp tick, in meters.
 pub const DISTANCE_PER_TICK_M: f32 = DISTANCE_OF_RADIO;
 
 /// Inverse of DISTANCE_OF_RADIO for faster multiplication instead of division
-pub const DISTANCE_OF_RADIO_INV: f32 = 213.139451293;
+pub const DISTANCE_OF_RADIO_INV: f32 = 213.139_45;
 
 /// Timestamp byte length - 40 bit -> 5 bytes
 pub const LENGTH_TIMESTAMP: usize = 5;
@@ -179,8 +179,8 @@ impl DW1000Time {
     /// * `data` - 5-byte array where the timestamp will be written
     pub fn get_timestamp_bytes(&self) -> [u8; LENGTH_TIMESTAMP] {
         let mut data = [0u8; LENGTH_TIMESTAMP];
-        for i in 0..LENGTH_TIMESTAMP {
-            data[i] = ((self.timestamp >> (i * 8)) & 0xFF) as u8;
+        for (index, byte) in data.iter_mut().enumerate() {
+            *byte = ((self.timestamp >> (index * 8)) & 0xFF) as u8;
         }
         data
     }

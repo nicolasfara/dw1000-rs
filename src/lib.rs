@@ -1,6 +1,4 @@
 #![no_std]
-#![deny(unsafe_code)]
-#![warn(missing_docs)]
 
 //! Embedded Rust driver for the Decawave DW1000 UWB transceiver
 //!

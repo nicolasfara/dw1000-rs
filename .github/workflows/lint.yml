@@ -1,0 +1,28 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: thumbv7em-none-eabi
+
+      - name: Lint root crate
+        run: cargo lint
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Lint Embassy example
+        run: cargo lint-embassy

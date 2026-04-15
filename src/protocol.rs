@@ -223,9 +223,9 @@ pub fn decode_poll_targets(
     if payload.len() != needed || output.len() < count {
         return Err(ProtocolError::BufferTooSmall);
     }
-    for index in 0..count {
+    for (index, target) in output.iter_mut().enumerate().take(count) {
         let base = 1 + index * POLL_TARGET_LEN;
-        output[index] = PollTarget {
+        *target = PollTarget {
             short_address: short_address_from(&payload[base..base + 2]),
             reply_delay_us: u16::from_le_bytes([payload[base + 2], payload[base + 3]]),
         };
@@ -246,9 +246,9 @@ pub fn decode_range_timings(
     if payload.len() != needed || output.len() < count {
         return Err(ProtocolError::BufferTooSmall);
     }
-    for index in 0..count {
+    for (index, timing) in output.iter_mut().enumerate().take(count) {
         let base = 1 + index * RANGE_TIMING_LEN;
-        output[index] = RangeTiming {
+        *timing = RangeTiming {
             short_address: short_address_from(&payload[base..base + 2]),
             poll_sent: time_from(&payload[base + 2..base + 7]),
             poll_ack_received: time_from(&payload[base + 7..base + 12]),

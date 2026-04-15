@@ -1,6 +1,11 @@
-use std::collections::VecDeque;
-use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
+#![allow(missing_docs)]
+
+extern crate alloc;
+
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use core::convert::Infallible;
+use std::sync::Mutex;
 
 use dw1000_rs::{
     AddressConfig, AntennaDelay, AsyncDw1000, Channel, DataRate, DeviceIdentity, DwTime, Eui64,

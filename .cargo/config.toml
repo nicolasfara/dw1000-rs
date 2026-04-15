@@ -1,2 +1,6 @@
 [env]
 DEFMT_LOG = "debug"
+
+[alias]
+lint = "clippy --all-targets --all-features -- -D warnings"
+lint-embassy = "clippy --manifest-path examples/embassy-stm32l432/Cargo.toml --target thumbv7em-none-eabi --bins --lib -- -D warnings"
