@@ -3,12 +3,13 @@
 use heapless::Vec;
 
 use crate::config::{RxOptions, TxOptions};
-use crate::device::{DeviceIdentity, Peer, PeerSnapshot, RxFrame, ShortAddress, Timestamps};
+use crate::device::{DeviceIdentity, Eui64, Peer, PeerSnapshot, RxFrame, ShortAddress, Timestamps};
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{
     decode_poll_targets, decode_range_timings, encode_discovery_blink, encode_poll,
     encode_poll_ack, encode_range, encode_range_failed, encode_range_report, encode_ranging_init,
-    parse_frame, Frame, FrameKind, PollTarget, RangeReportPayload, RangeTiming,
+    parse_frame, BlinkFrame, Frame, FrameHeader, FrameKind, PollTarget, RangeReportPayload,
+    RangeTiming, RangingInitFrame,
 };
 use crate::time::DwTime;
 
@@ -292,20 +293,27 @@ impl<const N: usize> RangingNode<N> {
         self.last_activity_ms = now_ms;
         match parse_frame(frame.bytes)? {
             Frame::Blink(blink) if self.role == Role::Anchor => {
+                let Some(snapshot) = self.accept_blink(blink, now_ms)? else {
+                    return Ok(None);
+                };
                 self.reset_protocol_state();
-                let peer = self.ensure_peer(Some(blink.source_eui), blink.source_short, now_ms)?;
-                let snapshot = PeerSnapshot::from(peer);
                 self.send_ranging_init(radio, blink.source_eui, blink.source_short)?;
                 Ok(Some(RangingEvent::BlinkReceived(snapshot)))
             }
-            Frame::RangingInit(header) if self.role == Role::Tag => {
+            Frame::RangingInit(init) if self.role == Role::Tag => {
+                let Some(short_address) = self.accept_ranging_init(init, now_ms)? else {
+                    return Ok(None);
+                };
                 self.reset_protocol_state();
-                let peer = self.ensure_peer(None, header.source, now_ms)?;
-                Ok(Some(RangingEvent::RangingInitReceived(peer.short_address)))
+                Ok(Some(RangingEvent::RangingInitReceived(short_address)))
             }
             Frame::Poll { header, payload } if self.role == Role::Anchor => {
+                let Some(peer_short) = self.accept_header(header, true, now_ms)? else {
+                    return Ok(None);
+                };
                 if self.expected != FrameKind::Poll {
                     self.reset_protocol_state();
+                    return Ok(None);
                 }
                 let mut targets = [PollTarget {
                     short_address: ShortAddress::new(0),
@@ -320,9 +328,9 @@ impl<const N: usize> RangingNode<N> {
                 else {
                     return Ok(None);
                 };
-                let peer = self
-                    .peer_mut(header.source)
-                    .ok_or(ProtocolError::UnknownPeer)?;
+                let Some(peer) = self.peer_mut(peer_short) else {
+                    return Ok(None);
+                };
                 peer.poll_received = frame.timestamp;
                 peer.last_activity_ms = now_ms;
                 peer.reply_delay_us = target.reply_delay_us;
@@ -332,14 +340,17 @@ impl<const N: usize> RangingNode<N> {
                 Ok(None)
             }
             Frame::PollAck { header } if self.role == Role::Tag => {
+                let Some(peer_short) = self.accept_header(header, false, now_ms)? else {
+                    return Ok(None);
+                };
                 if self.expected != FrameKind::PollAck {
                     self.reset_protocol_state();
                     return Ok(None);
                 }
                 let short_address = {
-                    let peer = self
-                        .peer_mut(header.source)
-                        .ok_or(ProtocolError::UnknownPeer)?;
+                    let Some(peer) = self.peer_mut(peer_short) else {
+                        return Ok(None);
+                    };
                     peer.poll_ack_received = frame.timestamp;
                     peer.last_activity_ms = now_ms;
                     peer.short_address
@@ -356,6 +367,9 @@ impl<const N: usize> RangingNode<N> {
                 Ok(None)
             }
             Frame::Range { header, payload } if self.role == Role::Anchor => {
+                let Some(peer_short) = self.accept_header(header, true, now_ms)? else {
+                    return Ok(None);
+                };
                 if self.expected != FrameKind::Range {
                     self.reset_protocol_state();
                     return Ok(None);
@@ -378,9 +392,9 @@ impl<const N: usize> RangingNode<N> {
                 self.expected = FrameKind::Poll;
                 let range_filter = self.config.range_filter;
                 let (destination, reply_delay_us, report, snapshot) = {
-                    let peer = self
-                        .peer_mut(header.source)
-                        .ok_or(ProtocolError::UnknownPeer)?;
+                    let Some(peer) = self.peer_mut(peer_short) else {
+                        return Ok(None);
+                    };
                     peer.range_received = frame.timestamp;
                     peer.poll_sent = timing.poll_sent;
                     peer.poll_ack_received = timing.poll_ack_received;
@@ -413,15 +427,18 @@ impl<const N: usize> RangingNode<N> {
                 Ok(Some(RangingEvent::RangeUpdated(snapshot)))
             }
             Frame::RangeReport { header, payload } if self.role == Role::Tag => {
+                let Some(peer_short) = self.accept_header(header, false, now_ms)? else {
+                    return Ok(None);
+                };
                 if self.expected != FrameKind::RangeReport {
                     self.reset_protocol_state();
                     return Ok(None);
                 }
                 let range_filter = self.config.range_filter;
                 let snapshot = {
-                    let peer = self
-                        .peer_mut(header.source)
-                        .ok_or(ProtocolError::UnknownPeer)?;
+                    let Some(peer) = self.peer_mut(peer_short) else {
+                        return Ok(None);
+                    };
                     let tof = DwTime::asymmetric_tof(
                         peer.poll_sent,
                         payload.poll_received,
@@ -440,10 +457,13 @@ impl<const N: usize> RangingNode<N> {
                 Ok(Some(RangingEvent::RangeUpdated(snapshot)))
             }
             Frame::RangeFailed { header } if self.role == Role::Tag => {
+                let Some(peer_short) = self.accept_header(header, false, now_ms)? else {
+                    return Ok(None);
+                };
                 self.reset_protocol_state();
-                self.peer_mut(header.source)
-                    .ok_or(ProtocolError::UnknownPeer)?
-                    .last_activity_ms = now_ms;
+                if let Some(peer) = self.peer_mut(peer_short) {
+                    peer.last_activity_ms = now_ms;
+                }
                 Ok(None)
             }
             _ => Ok(None),
@@ -556,8 +576,9 @@ impl<const N: usize> RangingNode<N> {
         }; N];
         let destination = destination.unwrap_or(ShortAddress::BROADCAST);
         let count = if destination.is_broadcast() {
+            let base_reply_delay_us = self.config.reply_delay_us;
             for (index, peer) in self.peers.iter_mut().enumerate() {
-                peer.reply_delay_us = ((2 * index + 1) as u16) * self.config.reply_delay_us;
+                peer.reply_delay_us = scheduled_reply_delay_us(base_reply_delay_us, index)?;
                 targets[index] = PollTarget {
                     short_address: peer.short_address,
                     reply_delay_us: peer.reply_delay_us,
@@ -726,7 +747,7 @@ impl<const N: usize> RangingNode<N> {
         eui: Option<crate::device::Eui64>,
         short_address: ShortAddress,
         now_ms: u32,
-    ) -> Result<&Peer, ProtocolError> {
+    ) -> Result<&mut Peer, ProtocolError> {
         if let Some(index) = self
             .peers
             .iter()
@@ -763,6 +784,65 @@ impl<const N: usize> RangingNode<N> {
         let sequence = self.sequence;
         self.sequence = self.sequence.wrapping_add(1);
         sequence
+    }
+
+    fn accept_blink(
+        &mut self,
+        blink: BlinkFrame,
+        now_ms: u32,
+    ) -> Result<Option<PeerSnapshot>, ProtocolError> {
+        let peer = self.ensure_peer(Some(blink.source_eui), blink.source_short, now_ms)?;
+        if !observe_peer_sequence(peer, blink.sequence) {
+            return Ok(None);
+        }
+        Ok(Some(PeerSnapshot::from(&*peer)))
+    }
+
+    fn accept_ranging_init(
+        &mut self,
+        init: RangingInitFrame,
+        now_ms: u32,
+    ) -> Result<Option<ShortAddress>, ProtocolError> {
+        if !self.matches_eui_destination(init.destination_eui) {
+            return Ok(None);
+        }
+        let peer = self.ensure_peer(None, init.source_short, now_ms)?;
+        if !observe_peer_sequence(peer, init.sequence) {
+            return Ok(None);
+        }
+        Ok(Some(peer.short_address))
+    }
+
+    fn accept_header(
+        &mut self,
+        header: FrameHeader,
+        allow_broadcast: bool,
+        now_ms: u32,
+    ) -> Result<Option<ShortAddress>, ProtocolError> {
+        if !self.matches_short_destination(header.destination, allow_broadcast) {
+            return Ok(None);
+        }
+        let Some(peer) = self.peer_mut(header.source) else {
+            return Ok(None);
+        };
+        if !observe_peer_sequence(peer, header.sequence) {
+            return Ok(None);
+        }
+        peer.last_activity_ms = now_ms;
+        Ok(Some(peer.short_address))
+    }
+
+    fn matches_short_destination(
+        &self,
+        destination: ShortAddress,
+        allow_broadcast: bool,
+    ) -> bool {
+        destination == self.config.identity.short_address
+            || (allow_broadcast && destination.is_broadcast())
+    }
+
+    fn matches_eui_destination(&self, destination: Eui64) -> bool {
+        destination == self.config.identity.eui
     }
 
     fn reset_protocol_state(&mut self) {
@@ -871,21 +951,28 @@ impl<const N: usize> RangingNode<N> {
         self.last_activity_ms = now_ms;
         match parse_frame(frame.bytes)? {
             Frame::Blink(blink) if self.role == Role::Anchor => {
+                let Some(snapshot) = self.accept_blink(blink, now_ms)? else {
+                    return Ok(None);
+                };
                 self.reset_protocol_state();
-                let peer = self.ensure_peer(Some(blink.source_eui), blink.source_short, now_ms)?;
-                let snapshot = PeerSnapshot::from(peer);
                 self.send_ranging_init_async(radio, blink.source_eui, blink.source_short)
                     .await?;
                 Ok(Some(RangingEvent::BlinkReceived(snapshot)))
             }
-            Frame::RangingInit(header) if self.role == Role::Tag => {
+            Frame::RangingInit(init) if self.role == Role::Tag => {
+                let Some(short_address) = self.accept_ranging_init(init, now_ms)? else {
+                    return Ok(None);
+                };
                 self.reset_protocol_state();
-                let peer = self.ensure_peer(None, header.source, now_ms)?;
-                Ok(Some(RangingEvent::RangingInitReceived(peer.short_address)))
+                Ok(Some(RangingEvent::RangingInitReceived(short_address)))
             }
             Frame::Poll { header, payload } if self.role == Role::Anchor => {
+                let Some(peer_short) = self.accept_header(header, true, now_ms)? else {
+                    return Ok(None);
+                };
                 if self.expected != FrameKind::Poll {
                     self.reset_protocol_state();
+                    return Ok(None);
                 }
                 let mut targets = [PollTarget {
                     short_address: ShortAddress::new(0),
@@ -900,9 +987,9 @@ impl<const N: usize> RangingNode<N> {
                 else {
                     return Ok(None);
                 };
-                let peer = self
-                    .peer_mut(header.source)
-                    .ok_or(ProtocolError::UnknownPeer)?;
+                let Some(peer) = self.peer_mut(peer_short) else {
+                    return Ok(None);
+                };
                 peer.poll_received = frame.timestamp;
                 peer.last_activity_ms = now_ms;
                 peer.reply_delay_us = target.reply_delay_us;
@@ -913,14 +1000,17 @@ impl<const N: usize> RangingNode<N> {
                 Ok(None)
             }
             Frame::PollAck { header } if self.role == Role::Tag => {
+                let Some(peer_short) = self.accept_header(header, false, now_ms)? else {
+                    return Ok(None);
+                };
                 if self.expected != FrameKind::PollAck {
                     self.reset_protocol_state();
                     return Ok(None);
                 }
                 let short_address = {
-                    let peer = self
-                        .peer_mut(header.source)
-                        .ok_or(ProtocolError::UnknownPeer)?;
+                    let Some(peer) = self.peer_mut(peer_short) else {
+                        return Ok(None);
+                    };
                     peer.poll_ack_received = frame.timestamp;
                     peer.last_activity_ms = now_ms;
                     peer.short_address
@@ -937,6 +1027,9 @@ impl<const N: usize> RangingNode<N> {
                 Ok(None)
             }
             Frame::Range { header, payload } if self.role == Role::Anchor => {
+                let Some(peer_short) = self.accept_header(header, true, now_ms)? else {
+                    return Ok(None);
+                };
                 if self.expected != FrameKind::Range {
                     self.reset_protocol_state();
                     return Ok(None);
@@ -959,9 +1052,9 @@ impl<const N: usize> RangingNode<N> {
                 self.expected = FrameKind::Poll;
                 let range_filter = self.config.range_filter;
                 let (destination, reply_delay_us, report, snapshot) = {
-                    let peer = self
-                        .peer_mut(header.source)
-                        .ok_or(ProtocolError::UnknownPeer)?;
+                    let Some(peer) = self.peer_mut(peer_short) else {
+                        return Ok(None);
+                    };
                     peer.range_received = frame.timestamp;
                     peer.poll_sent = timing.poll_sent;
                     peer.poll_ack_received = timing.poll_ack_received;
@@ -995,15 +1088,18 @@ impl<const N: usize> RangingNode<N> {
                 Ok(Some(RangingEvent::RangeUpdated(snapshot)))
             }
             Frame::RangeReport { header, payload } if self.role == Role::Tag => {
+                let Some(peer_short) = self.accept_header(header, false, now_ms)? else {
+                    return Ok(None);
+                };
                 if self.expected != FrameKind::RangeReport {
                     self.reset_protocol_state();
                     return Ok(None);
                 }
                 let range_filter = self.config.range_filter;
                 let snapshot = {
-                    let peer = self
-                        .peer_mut(header.source)
-                        .ok_or(ProtocolError::UnknownPeer)?;
+                    let Some(peer) = self.peer_mut(peer_short) else {
+                        return Ok(None);
+                    };
                     let tof = DwTime::asymmetric_tof(
                         peer.poll_sent,
                         payload.poll_received,
@@ -1022,10 +1118,13 @@ impl<const N: usize> RangingNode<N> {
                 Ok(Some(RangingEvent::RangeUpdated(snapshot)))
             }
             Frame::RangeFailed { header } if self.role == Role::Tag => {
+                let Some(peer_short) = self.accept_header(header, false, now_ms)? else {
+                    return Ok(None);
+                };
                 self.reset_protocol_state();
-                self.peer_mut(header.source)
-                    .ok_or(ProtocolError::UnknownPeer)?
-                    .last_activity_ms = now_ms;
+                if let Some(peer) = self.peer_mut(peer_short) {
+                    peer.last_activity_ms = now_ms;
+                }
                 Ok(None)
             }
             _ => Ok(None),
@@ -1126,8 +1225,9 @@ impl<const N: usize> RangingNode<N> {
         }; N];
         let destination = destination.unwrap_or(ShortAddress::BROADCAST);
         let count = if destination.is_broadcast() {
+            let base_reply_delay_us = self.config.reply_delay_us;
             for (index, peer) in self.peers.iter_mut().enumerate() {
-                peer.reply_delay_us = ((2 * index + 1) as u16) * self.config.reply_delay_us;
+                peer.reply_delay_us = scheduled_reply_delay_us(base_reply_delay_us, index)?;
                 targets[index] = PollTarget {
                     short_address: peer.short_address,
                     reply_delay_us: peer.reply_delay_us,
@@ -1306,4 +1406,30 @@ fn filtered_range(range_filter: Option<u16>, previous: f32, distance: f32) -> f3
         }
     }
     distance
+}
+
+fn scheduled_reply_delay_us(base_reply_delay_us: u16, index: usize) -> Result<u16, ProtocolError> {
+    let slot = index
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(ProtocolError::ReplyDelayOverflow)?;
+    let multiplier = u32::try_from(slot).map_err(|_| ProtocolError::ReplyDelayOverflow)?;
+    let delay = u32::from(base_reply_delay_us)
+        .checked_mul(multiplier)
+        .ok_or(ProtocolError::ReplyDelayOverflow)?;
+    u16::try_from(delay).map_err(|_| ProtocolError::ReplyDelayOverflow)
+}
+
+fn observe_peer_sequence(peer: &mut Peer, sequence: u8) -> bool {
+    let is_fresh = match peer.last_sequence {
+        None => true,
+        Some(last_sequence) => {
+            let delta = sequence.wrapping_sub(last_sequence);
+            delta != 0 && delta < 128
+        }
+    };
+    if is_fresh {
+        peer.last_sequence = Some(sequence);
+    }
+    is_fresh
 }

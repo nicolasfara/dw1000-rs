@@ -9,7 +9,8 @@ use std::sync::Mutex;
 
 use dw1000_rs::{
     AddressConfig, AntennaDelay, Channel, DataRate, DeviceIdentity, Dw1000, Eui64, PanId,
-    PreambleLength, PulseFrequency, RadioConfig, RxOptions, ShortAddress, SysStatus, TxOptions,
+    PreambleLength, PulseFrequency, RadioConfig, RxError, RxOptions, ShortAddress, SysStatus,
+    TxOptions,
 };
 use embedded_hal::digital::{ErrorType as DigitalErrorType, InputPin, OutputPin};
 use embedded_hal::spi::{
@@ -203,6 +204,24 @@ fn read_sys_status_decodes_bits() {
     let mut driver = Dw1000::new(spi, MockInputPin, MockOutputPin);
     let status = driver.read_sys_status().unwrap();
     assert_eq!(status, SysStatus((1 << 7) | (1 << 14)));
+}
+
+#[test]
+fn read_frame_rejects_non_rx_status() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let spi = RecordingSpi::new(
+        log,
+        VecDeque::from(vec![
+            vec![0; 4],
+            dw1000_rs::registers::sys_status_to_bytes(dw1000_rs::registers::status::TX_FRAME_SENT)
+                .to_vec(),
+        ]),
+    );
+    let mut driver = Dw1000::new(spi, MockInputPin, MockOutputPin);
+    driver.reconfigure(&config()).unwrap();
+
+    let error = driver.read_frame(&mut [0u8; 16]).unwrap_err();
+    assert_eq!(error, dw1000_rs::Error::Receive(RxError::FrameNotReady));
 }
 
 #[test]

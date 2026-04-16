@@ -209,6 +209,8 @@ pub struct Peer {
     pub short_address: ShortAddress,
     /// Last activity timestamp in host milliseconds.
     pub last_activity_ms: u32,
+    /// Most recent inbound sequence number accepted from this peer.
+    pub last_sequence: Option<u8>,
     /// Reply delay selected for this peer.
     pub reply_delay_us: u16,
     /// Ranging timestamps.
@@ -236,6 +238,7 @@ impl Peer {
             eui,
             short_address,
             last_activity_ms: 0,
+            last_sequence: None,
             reply_delay_us: 0,
             poll_sent: DwTime::zero(),
             poll_received: DwTime::zero(),

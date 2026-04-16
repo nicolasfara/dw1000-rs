@@ -97,6 +97,9 @@ impl DriverRuntime {
         if status.contains(status::RX_TIMEOUT) {
             return Err(RxError::Timeout);
         }
+        if !status.contains(status::RX_FRAME_READY) {
+            return Err(RxError::FrameNotReady);
+        }
         Ok(())
     }
 

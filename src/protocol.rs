@@ -63,6 +63,18 @@ pub struct BlinkFrame {
     pub source_eui: Eui64,
 }
 
+/// Parsed ranging-init frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RangingInitFrame {
+    /// Sequence number.
+    pub sequence: u8,
+    /// Source short address.
+    pub source_short: ShortAddress,
+    /// Destination EUI-64.
+    pub destination_eui: Eui64,
+}
+
 /// Poll target entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -108,7 +120,7 @@ pub enum Frame<'a> {
     /// Blink frame.
     Blink(BlinkFrame),
     /// Ranging-init frame.
-    RangingInit(FrameHeader),
+    RangingInit(RangingInitFrame),
     /// Poll frame.
     Poll {
         /// Common header.
@@ -176,10 +188,10 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Frame<'_>, ProtocolError> {
             if bytes.len() != RANGING_INIT_LEN {
                 return Err(ProtocolError::InvalidFrame);
             }
-            Ok(Frame::RangingInit(FrameHeader {
+            Ok(Frame::RangingInit(RangingInitFrame {
                 sequence: bytes[1],
-                source: short_address_from(&bytes[2..4]),
-                destination: ShortAddress::BROADCAST,
+                source_short: short_address_from(&bytes[2..4]),
+                destination_eui: eui_from(&bytes[4..12]),
             }))
         }
         FrameKind::Poll => {

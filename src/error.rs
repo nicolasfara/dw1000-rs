@@ -9,6 +9,8 @@ use crate::config::ConfigError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(Format))]
 pub enum RxError {
+    /// No completed RX frame is available to read.
+    FrameNotReady,
     /// Leading-edge detection failed.
     LeadingEdgeDetection,
     /// Frame check sequence failed.
@@ -35,6 +37,8 @@ pub enum ProtocolError {
     PeerTableFull,
     /// The requested peer is unknown.
     UnknownPeer,
+    /// The configured reply delay cannot be represented on the wire.
+    ReplyDelayOverflow,
 }
 
 /// Top-level crate error.

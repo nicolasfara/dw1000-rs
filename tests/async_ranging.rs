@@ -4,11 +4,15 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 
-use dw1000_rs::protocol::{detect_frame_kind, FrameKind};
+use dw1000_rs::protocol::{
+    detect_frame_kind, encode_poll_ack, encode_range_report, encode_ranging_init, FrameKind,
+    RangeReportPayload,
+};
 use dw1000_rs::ranging::AsyncRangingRadio;
 use dw1000_rs::{
-    DeviceIdentity, DwTime, Error, Eui64, PanId, RangingConfig, RangingEvent, RangingNode, Role,
-    RxFrame, RxOptions, ShortAddress, SignalMetrics, SysStatus, Timestamps, TxOptions,
+    DeviceIdentity, DwTime, Error, Eui64, PanId, ProtocolError, RangingConfig, RangingEvent,
+    RangingNode, Role, RxFrame, RxOptions, ShortAddress, SignalMetrics, SysStatus, Timestamps,
+    TxOptions,
 };
 use futures::executor::block_on;
 
@@ -356,5 +360,210 @@ fn recover_link_preserves_peer_and_next_poll_is_accepted_without_rediscovery() {
             detect_frame_kind(anchor_radio.last_tx()).unwrap(),
             FrameKind::PollAck
         );
+    });
+}
+
+#[test]
+fn tag_ignores_poll_ack_for_other_destination() {
+    block_on(async {
+        let tag_identity = identity(0x1234, [1, 2, 3, 4, 5, 6, 7, 8]);
+        let anchor_identity = identity(0x4321, [9, 10, 11, 12, 13, 14, 15, 16]);
+        let mut tag = RangingNode::<4>::new(Role::Tag, RangingConfig::new(tag_identity));
+        let mut radio = MockRadio::default();
+
+        tag.start_async(&mut radio, 0).await.unwrap();
+        tag.tick_async(&mut radio, 80).await.unwrap();
+
+        let mut init = [0u8; 127];
+        let init_len = encode_ranging_init(
+            0,
+            anchor_identity.short_address,
+            tag_identity.eui,
+            &mut init,
+        )
+        .unwrap();
+        radio.push_rx(&init[..init_len], DwTime::from_ticks(20), metrics());
+        let init_event = tag
+            .on_rx_async(&mut radio, 81, &mut [0u8; 127])
+            .await
+            .unwrap();
+        assert_eq!(
+            init_event,
+            Some(RangingEvent::RangingInitReceived(anchor_identity.short_address))
+        );
+
+        tag.tick_async(&mut radio, 160).await.unwrap();
+        radio.next_timestamps.push_back(Timestamps {
+            tx: DwTime::from_ticks(100),
+            rx: DwTime::zero(),
+            system: DwTime::zero(),
+        });
+        tag.on_tx_done_async(&mut radio).await.unwrap();
+
+        let tx_count_before = radio.transmitted.len();
+        let mut wrong_poll_ack = [0u8; 127];
+        let wrong_poll_ack_len = encode_poll_ack(
+            1,
+            anchor_identity.short_address,
+            ShortAddress::new(0x7777),
+            &mut wrong_poll_ack,
+        )
+        .unwrap();
+        radio.push_rx(
+            &wrong_poll_ack[..wrong_poll_ack_len],
+            DwTime::from_ticks(200),
+            metrics(),
+        );
+        assert_eq!(
+            tag.on_rx_async(&mut radio, 161, &mut [0u8; 127])
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(radio.transmitted.len(), tx_count_before);
+
+        radio.delayed_times.push_back(DwTime::from_ticks(260));
+        let mut poll_ack = [0u8; 127];
+        let poll_ack_len = encode_poll_ack(
+            1,
+            anchor_identity.short_address,
+            tag_identity.short_address,
+            &mut poll_ack,
+        )
+        .unwrap();
+        radio.push_rx(&poll_ack[..poll_ack_len], DwTime::from_ticks(200), metrics());
+        assert_eq!(
+            tag.on_rx_async(&mut radio, 162, &mut [0u8; 127])
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(detect_frame_kind(radio.last_tx()).unwrap(), FrameKind::Range);
+    });
+}
+
+#[test]
+fn stale_poll_ack_is_ignored_while_waiting_for_range_report() {
+    block_on(async {
+        let tag_identity = identity(0x1234, [17, 18, 19, 20, 21, 22, 23, 24]);
+        let anchor_identity = identity(0x4321, [25, 26, 27, 28, 29, 30, 31, 32]);
+        let mut tag = RangingNode::<4>::new(Role::Tag, RangingConfig::new(tag_identity));
+        let mut radio = MockRadio::default();
+
+        tag.start_async(&mut radio, 0).await.unwrap();
+        tag.tick_async(&mut radio, 80).await.unwrap();
+
+        let mut init = [0u8; 127];
+        let init_len = encode_ranging_init(
+            0,
+            anchor_identity.short_address,
+            tag_identity.eui,
+            &mut init,
+        )
+        .unwrap();
+        radio.push_rx(&init[..init_len], DwTime::from_ticks(20), metrics());
+        tag.on_rx_async(&mut radio, 81, &mut [0u8; 127])
+            .await
+            .unwrap();
+
+        tag.tick_async(&mut radio, 160).await.unwrap();
+        radio.next_timestamps.push_back(Timestamps {
+            tx: DwTime::from_ticks(100),
+            rx: DwTime::zero(),
+            system: DwTime::zero(),
+        });
+        tag.on_tx_done_async(&mut radio).await.unwrap();
+
+        radio.delayed_times.push_back(DwTime::from_ticks(260));
+        let mut poll_ack = [0u8; 127];
+        let poll_ack_len = encode_poll_ack(
+            1,
+            anchor_identity.short_address,
+            tag_identity.short_address,
+            &mut poll_ack,
+        )
+        .unwrap();
+        radio.push_rx(&poll_ack[..poll_ack_len], DwTime::from_ticks(200), metrics());
+        tag.on_rx_async(&mut radio, 161, &mut [0u8; 127])
+            .await
+            .unwrap();
+        radio.next_timestamps.push_back(Timestamps {
+            tx: DwTime::from_ticks(260),
+            rx: DwTime::zero(),
+            system: DwTime::zero(),
+        });
+        tag.on_tx_done_async(&mut radio).await.unwrap();
+
+        let tx_count_before = radio.transmitted.len();
+        radio.push_rx(&poll_ack[..poll_ack_len], DwTime::from_ticks(200), metrics());
+        assert_eq!(
+            tag.on_rx_async(&mut radio, 162, &mut [0u8; 127])
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(radio.transmitted.len(), tx_count_before);
+
+        let mut range_report = [0u8; 127];
+        let range_report_len = encode_range_report(
+            2,
+            anchor_identity.short_address,
+            tag_identity.short_address,
+            RangeReportPayload {
+                poll_received: DwTime::from_ticks(120),
+                poll_ack_sent: DwTime::from_ticks(180),
+                range_received: DwTime::from_ticks(280),
+                receive_power_dbm: -82.0,
+            },
+            &mut range_report,
+        )
+        .unwrap();
+        radio.push_rx(
+            &range_report[..range_report_len],
+            DwTime::from_ticks(300),
+            metrics(),
+        );
+        assert!(matches!(
+            tag.on_rx_async(&mut radio, 163, &mut [0u8; 127])
+                .await
+                .unwrap(),
+            Some(RangingEvent::RangeUpdated(_))
+        ));
+    });
+}
+
+#[test]
+fn broadcast_poll_reports_reply_delay_overflow() {
+    block_on(async {
+        let tag_identity = identity(0x1234, [33, 34, 35, 36, 37, 38, 39, 40]);
+        let anchor_a = identity(0x4001, [41, 42, 43, 44, 45, 46, 47, 48]);
+        let anchor_b = identity(0x4002, [49, 50, 51, 52, 53, 54, 55, 56]);
+        let mut config = RangingConfig::new(tag_identity);
+        config.reply_delay_us = 40_000;
+
+        let mut tag = RangingNode::<2>::new(Role::Tag, config);
+        let mut radio = MockRadio::default();
+
+        tag.start_async(&mut radio, 0).await.unwrap();
+        tag.tick_async(&mut radio, 80).await.unwrap();
+
+        let mut init = [0u8; 127];
+        let init_len = encode_ranging_init(0, anchor_a.short_address, tag_identity.eui, &mut init)
+            .unwrap();
+        radio.push_rx(&init[..init_len], DwTime::from_ticks(20), metrics());
+        tag.on_rx_async(&mut radio, 81, &mut [0u8; 127])
+            .await
+            .unwrap();
+
+        let mut init = [0u8; 127];
+        let init_len = encode_ranging_init(0, anchor_b.short_address, tag_identity.eui, &mut init)
+            .unwrap();
+        radio.push_rx(&init[..init_len], DwTime::from_ticks(21), metrics());
+        tag.on_rx_async(&mut radio, 82, &mut [0u8; 127])
+            .await
+            .unwrap();
+
+        let error = tag.tick_async(&mut radio, 160).await.unwrap_err();
+        assert_eq!(error, Error::Protocol(ProtocolError::ReplyDelayOverflow));
     });
 }

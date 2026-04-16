@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use dw1000_rs::{
     AddressConfig, AntennaDelay, AsyncDw1000, Channel, DataRate, DeviceIdentity, DwTime, Eui64,
-    PanId, PreambleLength, PulseFrequency, RadioConfig, RxOptions, SysStatus, TxOptions,
+    PanId, PreambleLength, PulseFrequency, RadioConfig, RxError, RxOptions, SysStatus, TxOptions,
 };
 use embedded_hal::digital::{ErrorType as DigitalErrorType, InputPin, OutputPin};
 use embedded_hal::spi::{Error as SpiErrorTrait, ErrorKind as SpiErrorKind, ErrorType, Operation};
@@ -253,6 +253,22 @@ fn async_read_frame_reads_payload_and_metrics() {
     assert!(frame.metrics.receive_power_dbm.is_finite());
     assert!(frame.metrics.first_path_power_dbm.is_finite());
     assert!(frame.metrics.quality > 0.0);
+}
+
+#[test]
+fn async_read_frame_rejects_non_rx_status() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let reads = VecDeque::from(vec![
+        vec![0; 4],
+        dw1000_rs::registers::sys_status_to_bytes(dw1000_rs::registers::status::TX_FRAME_SENT)
+            .to_vec(),
+    ]);
+    let spi = RecordingAsyncSpi::new(log, reads);
+    let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
+
+    block_on(driver.reconfigure(&config())).unwrap();
+    let error = block_on(driver.read_frame(&mut [0u8; 16])).unwrap_err();
+    assert_eq!(error, dw1000_rs::Error::Receive(RxError::FrameNotReady));
 }
 
 #[test]
