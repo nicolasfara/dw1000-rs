@@ -272,6 +272,16 @@ fn async_read_frame_rejects_non_rx_status() {
 }
 
 #[test]
+fn async_read_signal_metrics_before_config_returns_not_configured() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let spi = RecordingAsyncSpi::new(log, VecDeque::new());
+    let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
+
+    let error = block_on(driver.read_signal_metrics()).unwrap_err();
+    assert_eq!(error, dw1000_rs::Error::NotConfigured);
+}
+
+#[test]
 fn async_clear_tx_sent_restarts_receive_when_permanent_mode_is_enabled() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let spi = RecordingAsyncSpi::new(log.clone(), VecDeque::new());

@@ -489,10 +489,7 @@ where
     }
 
     fn read_first_path_power(&mut self) -> Result<f32, Error<SPI::Error, PinE>> {
-        let phy = self
-            .runtime
-            .phy
-            .expect("phy configuration must be available");
+        let phy = self.runtime.phy.ok_or(Error::NotConfigured)?;
         let mut fp1 = [0u8; LEN_FP_AMPL1];
         let mut fp2 = [0u8; LEN_FP_AMPL2];
         let mut fp3 = [0u8; LEN_FP_AMPL3];
@@ -511,10 +508,7 @@ where
     }
 
     fn read_receive_power(&mut self) -> Result<f32, Error<SPI::Error, PinE>> {
-        let phy = self
-            .runtime
-            .phy
-            .expect("phy configuration must be available");
+        let phy = self.runtime.phy.ok_or(Error::NotConfigured)?;
         let mut cir = [0u8; LEN_CIR_PWR];
         let mut info = [0u8; LEN_RX_FINFO];
         self.read_register(Register::RxFqual, CIR_PWR_SUB, &mut cir)?;

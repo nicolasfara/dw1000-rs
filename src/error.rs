@@ -55,6 +55,8 @@ pub enum Error<SpiE, PinE> {
     Protocol(ProtocolError),
     /// Invalid configuration supplied to the driver.
     InvalidConfig(ConfigError),
+    /// The driver operation requires a completed radio configuration.
+    NotConfigured,
     /// Caller-provided buffer was too small.
     BufferTooSmall {
         /// Actual buffer length.

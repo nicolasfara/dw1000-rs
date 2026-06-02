@@ -385,6 +385,8 @@ impl DW1000Configuration {
 pub enum ConfigError {
     /// The requested preamble length cannot be used with the selected PHY setup.
     UnsupportedPreambleLength,
+    /// The selected preamble code cannot be used with the selected pulse frequency.
+    InvalidPreambleCode,
 }
 
 /// Addressing configuration written into the DW1000.
@@ -435,14 +437,19 @@ pub struct ValidatedPhyConfig {
 
 impl PhyConfig {
     fn validated(self) -> Result<ValidatedPhyConfig, ConfigError> {
+        let preamble_code = self
+            .preamble_code
+            .unwrap_or(default_preamble_code(self.pulse_frequency));
+        if !preamble_code_matches_pulse_frequency(preamble_code, self.pulse_frequency) {
+            return Err(ConfigError::InvalidPreambleCode);
+        }
+
         Ok(ValidatedPhyConfig {
             data_rate: self.data_rate,
             pulse_frequency: self.pulse_frequency,
             preamble_length: self.preamble_length,
             channel: self.channel,
-            preamble_code: self
-                .preamble_code
-                .unwrap_or(default_preamble_code(self.pulse_frequency)),
+            preamble_code,
             pac_size: pac_size_for_preamble(self.preamble_length),
             smart_power: self.smart_power,
         })
@@ -521,6 +528,36 @@ const fn default_preamble_code(pulse_frequency: PulseFrequency) -> PreambleCode 
     }
 }
 
+const fn preamble_code_matches_pulse_frequency(
+    preamble_code: PreambleCode,
+    pulse_frequency: PulseFrequency,
+) -> bool {
+    matches!(
+        (pulse_frequency, preamble_code),
+        (
+            PulseFrequency::Mhz16,
+            PreambleCode::Code1
+                | PreambleCode::Code2
+                | PreambleCode::Code3
+                | PreambleCode::Code4
+                | PreambleCode::Code5
+                | PreambleCode::Code6
+                | PreambleCode::Code7
+                | PreambleCode::Code8
+        ) | (
+            PulseFrequency::Mhz64,
+            PreambleCode::Code9
+                | PreambleCode::Code10
+                | PreambleCode::Code11
+                | PreambleCode::Code12
+                | PreambleCode::Code17
+                | PreambleCode::Code18
+                | PreambleCode::Code19
+                | PreambleCode::Code20
+        )
+    )
+}
+
 const fn pac_size_for_preamble(preamble_length: PreambleLength) -> PacSize {
     match preamble_length {
         PreambleLength::Symbols64 | PreambleLength::Symbols128 => PacSize::Symbols8,
@@ -529,5 +566,70 @@ const fn pac_size_for_preamble(preamble_length: PreambleLength) -> PacSize {
         PreambleLength::Symbols1536 | PreambleLength::Symbols2048 | PreambleLength::Symbols4096 => {
             PacSize::Symbols64
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Channel, ConfigError, DataRate, PhyConfig, PreambleCode, PreambleLength, PulseFrequency,
+    };
+
+    fn phy_config(
+        pulse_frequency: PulseFrequency,
+        preamble_code: Option<PreambleCode>,
+    ) -> PhyConfig {
+        PhyConfig {
+            data_rate: DataRate::Kbps110,
+            pulse_frequency,
+            preamble_length: PreambleLength::Symbols2048,
+            channel: Channel::Channel5,
+            preamble_code,
+            smart_power: false,
+        }
+    }
+
+    #[test]
+    fn explicit_preamble_code_must_match_pulse_frequency() {
+        assert_eq!(
+            phy_config(PulseFrequency::Mhz16, Some(PreambleCode::Code4))
+                .validated()
+                .unwrap()
+                .preamble_code,
+            PreambleCode::Code4
+        );
+        assert_eq!(
+            phy_config(PulseFrequency::Mhz64, Some(PreambleCode::Code10))
+                .validated()
+                .unwrap()
+                .preamble_code,
+            PreambleCode::Code10
+        );
+        assert_eq!(
+            phy_config(PulseFrequency::Mhz16, Some(PreambleCode::Code10)).validated(),
+            Err(ConfigError::InvalidPreambleCode)
+        );
+        assert_eq!(
+            phy_config(PulseFrequency::Mhz64, Some(PreambleCode::Code4)).validated(),
+            Err(ConfigError::InvalidPreambleCode)
+        );
+    }
+
+    #[test]
+    fn default_preamble_codes_still_resolve_for_each_pulse_frequency() {
+        assert_eq!(
+            phy_config(PulseFrequency::Mhz16, None)
+                .validated()
+                .unwrap()
+                .preamble_code,
+            PreambleCode::Code4
+        );
+        assert_eq!(
+            phy_config(PulseFrequency::Mhz64, None)
+                .validated()
+                .unwrap()
+                .preamble_code,
+            PreambleCode::Code10
+        );
     }
 }
