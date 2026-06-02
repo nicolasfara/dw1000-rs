@@ -389,7 +389,9 @@ fn tag_ignores_poll_ack_for_other_destination() {
             .unwrap();
         assert_eq!(
             init_event,
-            Some(RangingEvent::RangingInitReceived(anchor_identity.short_address))
+            Some(RangingEvent::RangingInitReceived(
+                anchor_identity.short_address
+            ))
         );
 
         tag.tick_async(&mut radio, 160).await.unwrap();
@@ -431,14 +433,21 @@ fn tag_ignores_poll_ack_for_other_destination() {
             &mut poll_ack,
         )
         .unwrap();
-        radio.push_rx(&poll_ack[..poll_ack_len], DwTime::from_ticks(200), metrics());
+        radio.push_rx(
+            &poll_ack[..poll_ack_len],
+            DwTime::from_ticks(200),
+            metrics(),
+        );
         assert_eq!(
             tag.on_rx_async(&mut radio, 162, &mut [0u8; 127])
                 .await
                 .unwrap(),
             None
         );
-        assert_eq!(detect_frame_kind(radio.last_tx()).unwrap(), FrameKind::Range);
+        assert_eq!(
+            detect_frame_kind(radio.last_tx()).unwrap(),
+            FrameKind::Range
+        );
     });
 }
 
@@ -483,7 +492,11 @@ fn stale_poll_ack_is_ignored_while_waiting_for_range_report() {
             &mut poll_ack,
         )
         .unwrap();
-        radio.push_rx(&poll_ack[..poll_ack_len], DwTime::from_ticks(200), metrics());
+        radio.push_rx(
+            &poll_ack[..poll_ack_len],
+            DwTime::from_ticks(200),
+            metrics(),
+        );
         tag.on_rx_async(&mut radio, 161, &mut [0u8; 127])
             .await
             .unwrap();
@@ -495,7 +508,11 @@ fn stale_poll_ack_is_ignored_while_waiting_for_range_report() {
         tag.on_tx_done_async(&mut radio).await.unwrap();
 
         let tx_count_before = radio.transmitted.len();
-        radio.push_rx(&poll_ack[..poll_ack_len], DwTime::from_ticks(200), metrics());
+        radio.push_rx(
+            &poll_ack[..poll_ack_len],
+            DwTime::from_ticks(200),
+            metrics(),
+        );
         assert_eq!(
             tag.on_rx_async(&mut radio, 162, &mut [0u8; 127])
                 .await
@@ -548,16 +565,16 @@ fn broadcast_poll_reports_reply_delay_overflow() {
         tag.tick_async(&mut radio, 80).await.unwrap();
 
         let mut init = [0u8; 127];
-        let init_len = encode_ranging_init(0, anchor_a.short_address, tag_identity.eui, &mut init)
-            .unwrap();
+        let init_len =
+            encode_ranging_init(0, anchor_a.short_address, tag_identity.eui, &mut init).unwrap();
         radio.push_rx(&init[..init_len], DwTime::from_ticks(20), metrics());
         tag.on_rx_async(&mut radio, 81, &mut [0u8; 127])
             .await
             .unwrap();
 
         let mut init = [0u8; 127];
-        let init_len = encode_ranging_init(0, anchor_b.short_address, tag_identity.eui, &mut init)
-            .unwrap();
+        let init_len =
+            encode_ranging_init(0, anchor_b.short_address, tag_identity.eui, &mut init).unwrap();
         radio.push_rx(&init[..init_len], DwTime::from_ticks(21), metrics());
         tag.on_rx_async(&mut radio, 82, &mut [0u8; 127])
             .await

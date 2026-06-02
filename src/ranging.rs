@@ -832,11 +832,7 @@ impl<const N: usize> RangingNode<N> {
         Ok(Some(peer.short_address))
     }
 
-    fn matches_short_destination(
-        &self,
-        destination: ShortAddress,
-        allow_broadcast: bool,
-    ) -> bool {
+    fn matches_short_destination(&self, destination: ShortAddress, allow_broadcast: bool) -> bool {
         destination == self.config.identity.short_address
             || (allow_broadcast && destination.is_broadcast())
     }
