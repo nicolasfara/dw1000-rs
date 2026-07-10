@@ -2,7 +2,7 @@ use defmt::{info, warn};
 use dw1000_rs::registers::status;
 use dw1000_rs::{
     AntennaDelay, DeviceIdentity, Error, OperatingMode, RadioConfig, RangingConfig, RangingEvent,
-    RangingNode, Role, SysStatus,
+    RangingNode, RangingSchedule, Role, SysStatus,
 };
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Ticker};
@@ -13,15 +13,23 @@ use crate::{
     RX_BUFFER_LEN,
 };
 
+const ANCHOR_HEARTBEAT_PERIOD_MS: u32 = 1_000;
+
 pub(crate) struct RangingApp<const N: usize> {
     board: Board,
     role: Role,
+    identity: DeviceIdentity,
+    anchor_is_coordinator: bool,
     radio_config: RadioConfig,
     node: RangingNode<N>,
     rx_buffer: [u8; RX_BUFFER_LEN],
     ticker: Ticker,
     last_radio_activity_ms: u32,
     last_range_update_ms: u32,
+    last_anchor_heartbeat_ms: u32,
+    last_schedule_sync_source: Option<dw1000_rs::ShortAddress>,
+    last_schedule_sync_ms: Option<u32>,
+    schedule_sync_count: u32,
 }
 
 pub(crate) struct AppInitError {
@@ -56,11 +64,13 @@ impl<const N: usize> RangingApp<N> {
         role: Role,
         identity: DeviceIdentity,
         antenna_delay: AntennaDelay,
+        schedule: RangingSchedule,
+        anchor_is_coordinator: bool,
     ) -> Result<Self, AppInitError> {
         board.announce_start(role, identity, antenna_delay);
 
         let radio_config = default_radio_config(identity, antenna_delay);
-        let ranging_config = default_ranging_config(identity);
+        let ranging_config = default_ranging_config(identity, schedule, anchor_is_coordinator);
         let mut node = RangingNode::<N>::new(role, ranging_config);
 
         if board.radio.init(&mut embassy_time::Delay, &radio_config).await.is_err() {
@@ -83,15 +93,30 @@ impl<const N: usize> RangingApp<N> {
             });
         }
 
+        if role == Role::Anchor {
+            info!(
+                "anchor listening short={=u16} coordinator={=bool} slot={=u8}",
+                identity.short_address.raw(),
+                anchor_is_coordinator,
+                schedule.anchor_slot
+            );
+        }
+
         Ok(Self {
             board,
             role,
+            identity,
+            anchor_is_coordinator,
             radio_config,
             node,
             rx_buffer: [0; RX_BUFFER_LEN],
             ticker: Ticker::every(Duration::from_millis(ranging_config.timer_period_ms as u64)),
             last_radio_activity_ms: now,
             last_range_update_ms: now,
+            last_anchor_heartbeat_ms: now,
+            last_schedule_sync_source: None,
+            last_schedule_sync_ms: None,
+            schedule_sync_count: 0,
         })
     }
 
@@ -118,10 +143,11 @@ impl<const N: usize> RangingApp<N> {
                 if self.node.tx_debug_snapshot() != tx_before || event.is_some() {
                     outcome = StepOutcome::RadioActivity;
                 }
-                if self.handle_event(event) {
+                if self.handle_event(event, now) {
                     outcome = StepOutcome::RangeUpdated;
                 }
                 self.record_outcome(now, outcome);
+                self.log_anchor_heartbeat(now);
             }
             Err(_) => self.recover(RecoverReason::new(now, "tick failed")).await,
         }
@@ -161,7 +187,7 @@ impl<const N: usize> RangingApp<N> {
                     .on_tx_done_async(&mut self.board.radio)
                     .await
                     .map_err(|_| RecoverReason::new(now, "tx handling failed"))?;
-                if self.handle_event(event) {
+                if self.handle_event(event, now) {
                     outcome = StepOutcome::RangeUpdated;
                 }
             }
@@ -174,7 +200,7 @@ impl<const N: usize> RangingApp<N> {
                 {
                     Ok(event) => {
                         outcome = outcome.merge(StepOutcome::RadioActivity);
-                        if self.handle_event(event) {
+                        if self.handle_event(event, now) {
                             outcome = StepOutcome::RangeUpdated;
                         }
                     }
@@ -244,7 +270,28 @@ impl<const N: usize> RangingApp<N> {
         }
     }
 
-    fn handle_event(&self, event: Option<RangingEvent>) -> bool {
+    fn log_anchor_heartbeat(&mut self, now: u32) {
+        if self.role != Role::Anchor
+            || now.wrapping_sub(self.last_anchor_heartbeat_ms) < ANCHOR_HEARTBEAT_PERIOD_MS
+        {
+            return;
+        }
+
+        self.last_anchor_heartbeat_ms = now;
+        let sync_age_ms = self
+            .last_schedule_sync_ms
+            .map(|last_sync| now.wrapping_sub(last_sync))
+            .unwrap_or(u32::MAX);
+        info!(
+            "anchor alive short={=u16} coordinator={=bool} sync_count={=u32} sync_age_ms={=u32}",
+            self.identity.short_address.raw(),
+            self.anchor_is_coordinator,
+            self.schedule_sync_count,
+            sync_age_ms
+        );
+    }
+
+    fn handle_event(&mut self, event: Option<RangingEvent>, now: u32) -> bool {
         match event {
             Some(RangingEvent::BlinkReceived(snapshot)) => {
                 info!(
@@ -273,15 +320,30 @@ impl<const N: usize> RangingApp<N> {
             Some(RangingEvent::RangeUpdated(snapshot)) => {
                 if self.role == Role::Tag {
                     info!(
-                        "tag distance anchor={=u16} range_m={=f32}",
+                        "uwb_range tag={=u16} anchor={=u16} range_m={=f32} quality={=f32}",
+                        self.identity.short_address.raw(),
                         snapshot.short_address.raw(),
-                        snapshot.range_m
+                        snapshot.range_m,
+                        snapshot.quality
                     );
                 }
                 true
             }
             Some(RangingEvent::RangingInitReceived(short)) => {
                 info!("tag ranging init from {=u16}", short.raw());
+                false
+            }
+            Some(RangingEvent::ScheduleSyncReceived(short)) => {
+                self.schedule_sync_count = self.schedule_sync_count.wrapping_add(1);
+                self.last_schedule_sync_ms = Some(now);
+                if self.last_schedule_sync_source != Some(short) {
+                    self.last_schedule_sync_source = Some(short);
+                    info!(
+                        "{=str} coordinator sync from {=u16}",
+                        role_label(self.role),
+                        short.raw()
+                    );
+                }
                 false
             }
             None => false,
@@ -307,10 +369,16 @@ fn default_radio_config(identity: DeviceIdentity, antenna_delay: AntennaDelay) -
     config
 }
 
-fn default_ranging_config(identity: DeviceIdentity) -> RangingConfig {
+fn default_ranging_config(
+    identity: DeviceIdentity,
+    schedule: RangingSchedule,
+    anchor_is_coordinator: bool,
+) -> RangingConfig {
     let mut config = RangingConfig::new(identity);
     config.reply_delay_us = RANGING_REPLY_DELAY_US;
     config.reset_period_ms = PEER_INACTIVITY_TIMEOUT_MS;
+    config.schedule = schedule;
+    config.anchor_is_coordinator = anchor_is_coordinator;
     config
 }
 

@@ -6,6 +6,7 @@ use crate::time::DwTime;
 
 const KIND_BLINK: u8 = 0x10;
 const KIND_RANGING_INIT: u8 = 0x11;
+const KIND_SCHEDULE_SYNC: u8 = 0x12;
 const KIND_POLL: u8 = 0x20;
 const KIND_POLL_ACK: u8 = 0x21;
 const KIND_RANGE: u8 = 0x22;
@@ -15,7 +16,8 @@ const KIND_RANGE_FAILED: u8 = 0x24;
 const COMMON_HEADER_LEN: usize = 6;
 const BLINK_LEN: usize = 12;
 const RANGING_INIT_LEN: usize = 12;
-const POLL_TARGET_LEN: usize = 4;
+const SCHEDULE_SYNC_PAYLOAD_LEN: usize = 9;
+const POLL_TARGET_LEN: usize = 6;
 const RANGE_TIMING_LEN: usize = 17;
 const RANGE_REPORT_LEN: usize = 19;
 
@@ -27,6 +29,8 @@ pub enum FrameKind {
     Blink,
     /// Anchor response that seeds the ranging session.
     RangingInit,
+    /// Coordinator frame that aligns tag TDMA slots.
+    ScheduleSync,
     /// Tag poll frame.
     Poll,
     /// Anchor delayed poll acknowledgement.
@@ -75,6 +79,20 @@ pub struct RangingInitFrame {
     pub destination_eui: Eui64,
 }
 
+/// Parsed TDMA schedule-sync frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ScheduleSyncFrame {
+    /// Common header.
+    pub header: FrameHeader,
+    /// Monotonic coordinator epoch in milliseconds.
+    pub epoch_ms: u32,
+    /// Total tag slots in the TDMA frame.
+    pub tag_slot_count: u8,
+    /// Duration of each tag slot, in milliseconds.
+    pub tag_slot_ms: u32,
+}
+
 /// Poll target entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -82,7 +100,7 @@ pub struct PollTarget {
     /// Short address of the intended anchor.
     pub short_address: ShortAddress,
     /// Reply delay in microseconds.
-    pub reply_delay_us: u16,
+    pub reply_delay_us: u32,
 }
 
 /// Range timing entry.
@@ -121,6 +139,8 @@ pub enum Frame<'a> {
     Blink(BlinkFrame),
     /// Ranging-init frame.
     RangingInit(RangingInitFrame),
+    /// Schedule-sync frame.
+    ScheduleSync(ScheduleSyncFrame),
     /// Poll frame.
     Poll {
         /// Common header.
@@ -162,6 +182,7 @@ pub fn detect_frame_kind(bytes: &[u8]) -> Result<FrameKind, ProtocolError> {
     match bytes[0] {
         KIND_BLINK => Ok(FrameKind::Blink),
         KIND_RANGING_INIT => Ok(FrameKind::RangingInit),
+        KIND_SCHEDULE_SYNC => Ok(FrameKind::ScheduleSync),
         KIND_POLL => Ok(FrameKind::Poll),
         KIND_POLL_ACK => Ok(FrameKind::PollAck),
         KIND_RANGE => Ok(FrameKind::Range),
@@ -194,6 +215,16 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Frame<'_>, ProtocolError> {
                 destination_eui: eui_from(&bytes[4..12]),
             }))
         }
+        FrameKind::ScheduleSync => {
+            let header = parse_common_header(bytes)?;
+            let payload = parse_schedule_sync_payload(&bytes[COMMON_HEADER_LEN..])?;
+            Ok(Frame::ScheduleSync(ScheduleSyncFrame {
+                header,
+                epoch_ms: payload.0,
+                tag_slot_count: payload.1,
+                tag_slot_ms: payload.2,
+            }))
+        }
         FrameKind::Poll => {
             let header = parse_common_header(bytes)?;
             Ok(Frame::Poll {
@@ -213,7 +244,8 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Frame<'_>, ProtocolError> {
         }
         FrameKind::RangeReport => {
             let header = parse_common_header(bytes)?;
-            let payload = parse_range_report_payload(&bytes[COMMON_HEADER_LEN..])?;
+            let payload: RangeReportPayload =
+                parse_range_report_payload(&bytes[COMMON_HEADER_LEN..])?;
             Ok(Frame::RangeReport { header, payload })
         }
         FrameKind::RangeFailed => Ok(Frame::RangeFailed {
@@ -239,7 +271,12 @@ pub fn decode_poll_targets(
         let base = 1 + index * POLL_TARGET_LEN;
         *target = PollTarget {
             short_address: short_address_from(&payload[base..base + 2]),
-            reply_delay_us: u16::from_le_bytes([payload[base + 2], payload[base + 3]]),
+            reply_delay_us: u32::from_le_bytes([
+                payload[base + 2],
+                payload[base + 3],
+                payload[base + 4],
+                payload[base + 5],
+            ]),
         };
     }
     Ok(count)
@@ -300,6 +337,26 @@ pub fn encode_ranging_init(
     Ok(RANGING_INIT_LEN)
 }
 
+/// Encodes a schedule-sync frame.
+pub fn encode_schedule_sync(
+    sequence: u8,
+    source: ShortAddress,
+    destination: ShortAddress,
+    epoch_ms: u32,
+    tag_slot_count: u8,
+    tag_slot_ms: u32,
+    buffer: &mut [u8],
+) -> Result<usize, ProtocolError> {
+    let len = COMMON_HEADER_LEN + SCHEDULE_SYNC_PAYLOAD_LEN;
+    ensure_capacity(buffer, len)?;
+    write_common_header(KIND_SCHEDULE_SYNC, sequence, source, destination, buffer);
+    let payload_start = COMMON_HEADER_LEN;
+    buffer[payload_start..payload_start + 4].copy_from_slice(&epoch_ms.to_le_bytes());
+    buffer[payload_start + 4] = tag_slot_count;
+    buffer[payload_start + 5..payload_start + 9].copy_from_slice(&tag_slot_ms.to_le_bytes());
+    Ok(len)
+}
+
 /// Encodes a poll frame.
 pub fn encode_poll(
     sequence: u8,
@@ -315,7 +372,7 @@ pub fn encode_poll(
     for (index, target) in targets.iter().enumerate() {
         let base = COMMON_HEADER_LEN + 1 + index * POLL_TARGET_LEN;
         buffer[base..base + 2].copy_from_slice(&target.short_address.to_le_bytes());
-        buffer[base + 2..base + 4].copy_from_slice(&target.reply_delay_us.to_le_bytes());
+        buffer[base + 2..base + 6].copy_from_slice(&target.reply_delay_us.to_le_bytes());
     }
     Ok(len)
 }
@@ -417,6 +474,17 @@ fn parse_range_report_payload(bytes: &[u8]) -> Result<RangeReportPayload, Protoc
         range_received: time_from(&bytes[10..15]),
         receive_power_dbm: f32::from_le_bytes([bytes[15], bytes[16], bytes[17], bytes[18]]),
     })
+}
+
+fn parse_schedule_sync_payload(bytes: &[u8]) -> Result<(u32, u8, u32), ProtocolError> {
+    if bytes.len() != SCHEDULE_SYNC_PAYLOAD_LEN {
+        return Err(ProtocolError::InvalidFrame);
+    }
+    Ok((
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        bytes[4],
+        u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]),
+    ))
 }
 
 fn write_common_header(

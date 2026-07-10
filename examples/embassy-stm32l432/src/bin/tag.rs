@@ -2,8 +2,10 @@
 #![no_std]
 
 use dw1000_embassy_stm32l432::run;
-use dw1000_rs::{AntennaDelay, DeviceIdentity, Eui64, PanId, Role, ShortAddress};
+use dw1000_rs::{AntennaDelay, DeviceIdentity, Eui64, PanId, RangingSchedule, Role, ShortAddress};
 use {defmt_rtt as _, panic_probe as _};
+
+include!(concat!(env!("OUT_DIR"), "/tag_identity.rs"));
 
 const TAG_ANTENNA_DELAY: AntennaDelay = AntennaDelay::new(16_456);
 
@@ -12,11 +14,21 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     run(
         Role::Tag,
         DeviceIdentity::new(
-            PanId::new(0x0D57),
-            ShortAddress::new(3345),
-            Eui64::new([0x82, 0x17, 0x5B, 0xD5, 0xA9, 0x9A, 0xE2, 0x9C]),
+            PanId::new(TAG_PAN_ID),
+            ShortAddress::new(TAG_SHORT_ADDRESS),
+            Eui64::new(TAG_EUI),
         ),
         TAG_ANTENNA_DELAY,
+        RangingSchedule {
+            anchor_slot: 0,
+            discovery_slot_spacing_us: DISCOVERY_SLOT_SPACING_US,
+            tag_slot: TAG_SLOT,
+            tag_slot_count: TAG_SLOT_COUNT,
+            tag_slot_ms: TAG_SLOT_MS,
+            session_timeout_ms: SESSION_TIMEOUT_MS,
+            range_period_ms: RANGE_PERIOD_MS,
+        },
+        false,
     )
     .await
 }

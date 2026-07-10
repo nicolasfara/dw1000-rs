@@ -212,7 +212,7 @@ pub struct Peer {
     /// Most recent inbound sequence number accepted from this peer.
     pub last_sequence: Option<u8>,
     /// Reply delay selected for this peer.
-    pub reply_delay_us: u16,
+    pub reply_delay_us: u32,
     /// Ranging timestamps.
     pub poll_sent: DwTime,
     /// Ranging timestamps.

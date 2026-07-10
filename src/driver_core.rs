@@ -19,6 +19,14 @@ use crate::time::{DwTime, DISTANCE_PER_TICK_M};
 
 pub(crate) const LEN_UWB_FRAMES: usize = 127;
 
+const RECEIVE_RESTART_EVENTS: u64 = status::RX_FRAME_READY.0
+    | status::RX_FRAME_GOOD.0
+    | status::RX_FRAME_CHECK_ERROR.0
+    | status::RX_REED_SOLOMON_ERROR.0
+    | status::RX_TIMEOUT.0
+    | status::RX_HEADER_ERROR.0
+    | status::LDE_ERROR.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClockMode {
     Auto,
@@ -164,9 +172,19 @@ impl DriverRuntime {
     }
 
     pub(crate) const fn should_restart_receive(&self, event_mask: SysStatus) -> bool {
-        self.rx_after_tx_pending
-            && matches!(self.state, DriverState::Tx)
-            && event_mask.contains(status::TX_FRAME_SENT)
+        if !self.permanent_receive {
+            return false;
+        }
+
+        match self.state {
+            DriverState::Tx => {
+                self.rx_after_tx_pending && event_mask.contains(status::TX_FRAME_SENT)
+            }
+            // RXAUTR should handle this in hardware, but explicitly rearming after
+            // the status is cleared keeps continuous receive reliable on all frames.
+            DriverState::Rx => (event_mask.0 & RECEIVE_RESTART_EVENTS) != 0,
+            DriverState::Idle => false,
+        }
     }
 
     pub(crate) fn checked_frame_len(&self, payload_len: usize) -> Result<usize, (usize, usize)> {

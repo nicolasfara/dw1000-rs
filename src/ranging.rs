@@ -8,8 +8,8 @@ use crate::error::{Error, ProtocolError};
 use crate::protocol::{
     decode_poll_targets, decode_range_timings, encode_discovery_blink, encode_poll,
     encode_poll_ack, encode_range, encode_range_failed, encode_range_report, encode_ranging_init,
-    parse_frame, BlinkFrame, Frame, FrameHeader, FrameKind, PollTarget, RangeReportPayload,
-    RangeTiming, RangingInitFrame,
+    encode_schedule_sync, parse_frame, BlinkFrame, Frame, FrameHeader, FrameKind, PollTarget,
+    RangeReportPayload, RangeTiming, RangingInitFrame, ScheduleSyncFrame,
 };
 use crate::time::DwTime;
 
@@ -39,6 +39,49 @@ pub enum RangingEvent {
     RangeUpdated(PeerSnapshot),
     /// A ranging-init message was received.
     RangingInitReceived(ShortAddress),
+    /// A schedule-sync message was received.
+    ScheduleSyncReceived(ShortAddress),
+}
+
+/// Deterministic ranging schedule for multi-anchor and multi-tag systems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct RangingSchedule {
+    /// Anchor response slot used during discovery.
+    pub anchor_slot: u8,
+    /// Spacing between delayed anchor discovery responses, in microseconds.
+    pub discovery_slot_spacing_us: u32,
+    /// Tag TDMA slot used for initiating ranging.
+    pub tag_slot: u8,
+    /// Number of tag TDMA slots.
+    pub tag_slot_count: u8,
+    /// Duration of each tag TDMA slot, in milliseconds.
+    pub tag_slot_ms: u32,
+    /// Timeout for poll-ack and range-report collection, in milliseconds.
+    pub session_timeout_ms: u32,
+    /// Minimum period between tag ranging attempts, in milliseconds.
+    pub range_period_ms: u32,
+}
+
+impl RangingSchedule {
+    /// Default schedule for one tag and up to four anchors.
+    pub const fn new() -> Self {
+        Self {
+            anchor_slot: 0,
+            discovery_slot_spacing_us: 12_000,
+            tag_slot: 0,
+            tag_slot_count: 1,
+            tag_slot_ms: 250,
+            session_timeout_ms: 160,
+            range_period_ms: 80,
+        }
+    }
+}
+
+impl Default for RangingSchedule {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Ranging configuration.
@@ -48,13 +91,17 @@ pub struct RangingConfig {
     /// Local identity used for frame addressing.
     pub identity: DeviceIdentity,
     /// Reply delay used by the protocol, in microseconds.
-    pub reply_delay_us: u16,
+    pub reply_delay_us: u32,
     /// Inactivity timeout, in milliseconds.
     pub reset_period_ms: u32,
     /// Periodic timer tick, in milliseconds.
     pub timer_period_ms: u32,
     /// Optional exponential moving average factor.
     pub range_filter: Option<u16>,
+    /// Multi-node deterministic schedule.
+    pub schedule: RangingSchedule,
+    /// Whether this anchor broadcasts schedule-sync frames.
+    pub anchor_is_coordinator: bool,
 }
 
 impl RangingConfig {
@@ -66,6 +113,8 @@ impl RangingConfig {
             reset_period_ms: 200,
             timer_period_ms: 80,
             range_filter: None,
+            schedule: RangingSchedule::new(),
+            anchor_is_coordinator: false,
         }
     }
 }
@@ -180,6 +229,10 @@ pub struct RangingNode<const N: usize> {
     last_tx_kind: Option<FrameKind>,
     last_tx_destination: ShortAddress,
     poll_acknowledged: Vec<ShortAddress, N>,
+    range_report_received: Vec<ShortAddress, N>,
+    session_deadline_ms: Option<u32>,
+    last_range_start_ms: u32,
+    schedule_epoch_ms: Option<u32>,
 }
 
 impl<const N: usize> RangingNode<N> {
@@ -200,6 +253,10 @@ impl<const N: usize> RangingNode<N> {
             last_tx_kind: None,
             last_tx_destination: ShortAddress::BROADCAST,
             poll_acknowledged: Vec::new(),
+            range_report_received: Vec::new(),
+            session_deadline_ms: None,
+            last_range_start_ms: 0,
+            schedule_epoch_ms: None,
         }
     }
 
@@ -267,8 +324,17 @@ impl<const N: usize> RangingNode<N> {
             }
             (Role::Tag, FrameKind::Range) => {
                 if self.last_tx_destination.is_broadcast() {
-                    for peer in self.peers.iter_mut() {
-                        peer.range_sent = timestamps.tx;
+                    if self.poll_acknowledged.is_empty() {
+                        for peer in self.peers.iter_mut() {
+                            peer.range_sent = timestamps.tx;
+                        }
+                    } else {
+                        for index in 0..self.poll_acknowledged.len() {
+                            let short = self.poll_acknowledged[index];
+                            if let Some(peer) = self.peer_mut(short) {
+                                peer.range_sent = timestamps.tx;
+                            }
+                        }
                     }
                 } else if let Some(peer) = self.peer_mut(self.last_tx_destination) {
                     peer.range_sent = timestamps.tx;
@@ -299,6 +365,15 @@ impl<const N: usize> RangingNode<N> {
                 self.reset_protocol_state();
                 self.send_ranging_init(radio, blink.source_eui, blink.source_short)?;
                 Ok(Some(RangingEvent::BlinkReceived(snapshot)))
+            }
+            Frame::ScheduleSync(sync) => {
+                let Some(short_address) = self.observe_schedule_sync(sync) else {
+                    return Ok(None);
+                };
+                if self.role == Role::Tag {
+                    self.accept_schedule_sync(sync, now_ms)?;
+                }
+                Ok(Some(RangingEvent::ScheduleSyncReceived(short_address)))
             }
             Frame::RangingInit(init) if self.role == Role::Tag => {
                 let Some(short_address) = self.accept_ranging_init(init, now_ms)? else {
@@ -361,7 +436,7 @@ impl<const N: usize> RangingNode<N> {
                         .map_err(|_| ProtocolError::PeerTableFull)?;
                 }
                 if self.poll_acknowledged.len() == self.peers.len() {
-                    self.expected = FrameKind::RangeReport;
+                    self.begin_range_report_phase(now_ms);
                     self.send_range(radio, None)?;
                 }
                 Ok(None)
@@ -435,7 +510,7 @@ impl<const N: usize> RangingNode<N> {
                     return Ok(None);
                 }
                 let range_filter = self.config.range_filter;
-                let snapshot = {
+                let (short_address, snapshot) = {
                     let Some(peer) = self.peer_mut(peer_short) else {
                         return Ok(None);
                     };
@@ -452,8 +527,16 @@ impl<const N: usize> RangingNode<N> {
                     peer.metrics.first_path_power_dbm = frame.metrics.first_path_power_dbm;
                     peer.metrics.quality = frame.metrics.quality;
                     peer.last_activity_ms = now_ms;
-                    PeerSnapshot::from(&*peer)
+                    (peer.short_address, PeerSnapshot::from(&*peer))
                 };
+                if !self.range_report_received.contains(&short_address) {
+                    self.range_report_received
+                        .push(short_address)
+                        .map_err(|_| ProtocolError::PeerTableFull)?;
+                }
+                if self.range_report_received.len() >= self.poll_acknowledged.len() {
+                    self.reset_protocol_state();
+                }
                 Ok(Some(RangingEvent::RangeUpdated(snapshot)))
             }
             Frame::RangeFailed { header } if self.role == Role::Tag => {
@@ -479,6 +562,10 @@ impl<const N: usize> RangingNode<N> {
     where
         R: RangingRadio<SpiE, PinE>,
     {
+        if self.finish_timed_out_session(radio, now_ms)? {
+            return Ok(None);
+        }
+
         if let Some(position) = self.peers.iter().position(|peer| {
             now_ms.saturating_sub(peer.last_activity_ms) > self.config.reset_period_ms
         }) {
@@ -492,14 +579,28 @@ impl<const N: usize> RangingNode<N> {
         }
         self.last_tick_ms = now_ms;
 
-        if self.role == Role::Tag {
+        if self.session_active() {
+            return Ok(None);
+        }
+
+        if self.role == Role::Anchor {
+            if self.config.anchor_is_coordinator
+                && now_ms.wrapping_sub(self.last_range_start_ms)
+                    >= self.config.schedule.range_period_ms
+            {
+                self.last_range_start_ms = now_ms;
+                self.send_schedule_sync(radio, now_ms)?;
+            }
+        } else if self.tag_slot_is_open(now_ms)
+            && now_ms.wrapping_sub(self.last_range_start_ms) >= self.config.schedule.range_period_ms
+        {
             if !self.peers.is_empty() && self.blink_counter != 0 {
-                self.expected = FrameKind::PollAck;
-                self.poll_acknowledged.clear();
+                self.begin_poll_ack_phase(now_ms);
                 self.send_poll(radio, None)?;
             } else {
                 self.send_blink(radio)?;
             }
+            self.last_range_start_ms = now_ms;
             self.blink_counter = if self.blink_counter >= 20 {
                 0
             } else {
@@ -558,6 +659,35 @@ impl<const N: usize> RangingNode<N> {
         )?;
         self.last_tx_kind = Some(FrameKind::RangingInit);
         self.last_tx_destination = destination_short;
+        radio.transmit(
+            &frame[..len],
+            TxOptions {
+                delayed_time: self.anchor_discovery_delay(),
+                wait_for_response: false,
+            },
+        )
+    }
+
+    fn send_schedule_sync<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        now_ms: u32,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_schedule_sync(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            ShortAddress::BROADCAST,
+            now_ms,
+            self.config.schedule.tag_slot_count,
+            self.config.schedule.tag_slot_ms,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::ScheduleSync);
+        self.last_tx_destination = ShortAddress::BROADCAST;
         radio.transmit(&frame[..len], TxOptions::default())
     }
 
@@ -613,7 +743,7 @@ impl<const N: usize> RangingNode<N> {
         &mut self,
         radio: &mut R,
         destination: ShortAddress,
-        reply_delay_us: u16,
+        reply_delay_us: u32,
     ) -> Result<(), Error<SpiE, PinE>>
     where
         R: RangingRadio<SpiE, PinE>,
@@ -655,15 +785,32 @@ impl<const N: usize> RangingNode<N> {
         let delay = DwTime::from_micros(self.config.reply_delay_us as f32);
         let range_sent = radio.compute_delayed_time(delay)?;
         let count = if destination.is_broadcast() {
-            for (index, peer) in self.peers.iter().enumerate() {
-                timings[index] = RangeTiming {
-                    short_address: peer.short_address,
-                    poll_sent: peer.poll_sent,
-                    poll_ack_received: peer.poll_ack_received,
-                    range_sent,
-                };
+            if self.poll_acknowledged.is_empty() {
+                for (index, peer) in self.peers.iter().enumerate() {
+                    timings[index] = RangeTiming {
+                        short_address: peer.short_address,
+                        poll_sent: peer.poll_sent,
+                        poll_ack_received: peer.poll_ack_received,
+                        range_sent,
+                    };
+                }
+                self.peers.len()
+            } else {
+                let mut count = 0;
+                for index in 0..self.poll_acknowledged.len() {
+                    let short = self.poll_acknowledged[index];
+                    if let Some(peer) = self.peer(short) {
+                        timings[count] = RangeTiming {
+                            short_address: peer.short_address,
+                            poll_sent: peer.poll_sent,
+                            poll_ack_received: peer.poll_ack_received,
+                            range_sent,
+                        };
+                        count += 1;
+                    }
+                }
+                count
             }
-            self.peers.len()
         } else {
             let peer = self.peer(destination).ok_or(ProtocolError::UnknownPeer)?;
             timings[0] = RangeTiming {
@@ -697,7 +844,7 @@ impl<const N: usize> RangingNode<N> {
         radio: &mut R,
         destination: ShortAddress,
         payload: RangeReportPayload,
-        reply_delay_us: u16,
+        reply_delay_us: u32,
     ) -> Result<(), Error<SpiE, PinE>>
     where
         R: RangingRadio<SpiE, PinE>,
@@ -813,6 +960,33 @@ impl<const N: usize> RangingNode<N> {
         Ok(Some(peer.short_address))
     }
 
+    fn observe_schedule_sync(&self, sync: ScheduleSyncFrame) -> Option<ShortAddress> {
+        self.matches_short_destination(sync.header.destination, true)
+            .then_some(sync.header.source)
+    }
+
+    fn accept_schedule_sync(
+        &mut self,
+        sync: ScheduleSyncFrame,
+        now_ms: u32,
+    ) -> Result<Option<ShortAddress>, ProtocolError> {
+        let Some(source) = self.observe_schedule_sync(sync) else {
+            return Ok(None);
+        };
+        let peer = self.ensure_peer(None, source, now_ms)?;
+        if !observe_peer_sequence(peer, sync.header.sequence) {
+            return Ok(None);
+        }
+        let short_address = peer.short_address;
+        let frame_ms = u32::from(sync.tag_slot_count).saturating_mul(sync.tag_slot_ms);
+        self.schedule_epoch_ms = Some(if frame_ms == 0 {
+            now_ms
+        } else {
+            now_ms.wrapping_sub(sync.epoch_ms % frame_ms)
+        });
+        Ok(Some(short_address))
+    }
+
     fn accept_header(
         &mut self,
         header: FrameHeader,
@@ -849,6 +1023,80 @@ impl<const N: usize> RangingNode<N> {
         self.last_tx_kind = None;
         self.last_tx_destination = ShortAddress::BROADCAST;
         self.poll_acknowledged.clear();
+        self.range_report_received.clear();
+        self.session_deadline_ms = None;
+    }
+
+    fn begin_poll_ack_phase(&mut self, now_ms: u32) {
+        self.expected = FrameKind::PollAck;
+        self.poll_acknowledged.clear();
+        self.range_report_received.clear();
+        self.session_deadline_ms =
+            Some(now_ms.wrapping_add(self.config.schedule.session_timeout_ms));
+    }
+
+    fn begin_range_report_phase(&mut self, now_ms: u32) {
+        self.expected = FrameKind::RangeReport;
+        self.range_report_received.clear();
+        self.session_deadline_ms =
+            Some(now_ms.wrapping_add(self.config.schedule.session_timeout_ms));
+    }
+
+    fn finish_timed_out_session<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        now_ms: u32,
+    ) -> Result<bool, Error<SpiE, PinE>>
+    where
+        R: RangingRadio<SpiE, PinE>,
+    {
+        if !self.session_expired(now_ms) {
+            return Ok(false);
+        }
+        match (self.role, self.expected) {
+            (Role::Tag, FrameKind::PollAck) if !self.poll_acknowledged.is_empty() => {
+                self.begin_range_report_phase(now_ms);
+                self.send_range(radio, None)?;
+                Ok(true)
+            }
+            (Role::Tag, FrameKind::PollAck | FrameKind::RangeReport) => {
+                self.reset_protocol_state();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn session_active(&self) -> bool {
+        matches!(self.expected, FrameKind::PollAck | FrameKind::RangeReport)
+            && self.session_deadline_ms.is_some()
+    }
+
+    fn session_expired(&self, now_ms: u32) -> bool {
+        self.session_deadline_ms
+            .map(|deadline| now_ms.wrapping_sub(deadline) < 0x8000_0000)
+            .unwrap_or(false)
+    }
+
+    fn tag_slot_is_open(&self, now_ms: u32) -> bool {
+        let count = u32::from(self.config.schedule.tag_slot_count.max(1));
+        if count <= 1 {
+            return true;
+        }
+        let slot_ms = self.config.schedule.tag_slot_ms;
+        if slot_ms == 0 {
+            return true;
+        }
+        let tag_slot = u32::from(self.config.schedule.tag_slot).min(count - 1);
+        let epoch = self.schedule_epoch_ms.unwrap_or(0);
+        let current_slot = (now_ms.wrapping_sub(epoch) / slot_ms) % count;
+        current_slot == tag_slot
+    }
+
+    fn anchor_discovery_delay(&self) -> Option<DwTime> {
+        let delay_us = u32::from(self.config.schedule.anchor_slot)
+            .saturating_mul(self.config.schedule.discovery_slot_spacing_us);
+        (delay_us != 0).then(|| DwTime::from_micros(delay_us as f32))
     }
 }
 
@@ -921,8 +1169,17 @@ impl<const N: usize> RangingNode<N> {
             }
             (Role::Tag, FrameKind::Range) => {
                 if self.last_tx_destination.is_broadcast() {
-                    for peer in self.peers.iter_mut() {
-                        peer.range_sent = timestamps.tx;
+                    if self.poll_acknowledged.is_empty() {
+                        for peer in self.peers.iter_mut() {
+                            peer.range_sent = timestamps.tx;
+                        }
+                    } else {
+                        for index in 0..self.poll_acknowledged.len() {
+                            let short = self.poll_acknowledged[index];
+                            if let Some(peer) = self.peer_mut(short) {
+                                peer.range_sent = timestamps.tx;
+                            }
+                        }
                     }
                 } else if let Some(peer) = self.peer_mut(self.last_tx_destination) {
                     peer.range_sent = timestamps.tx;
@@ -954,6 +1211,15 @@ impl<const N: usize> RangingNode<N> {
                 self.send_ranging_init_async(radio, blink.source_eui, blink.source_short)
                     .await?;
                 Ok(Some(RangingEvent::BlinkReceived(snapshot)))
+            }
+            Frame::ScheduleSync(sync) => {
+                let Some(short_address) = self.observe_schedule_sync(sync) else {
+                    return Ok(None);
+                };
+                if self.role == Role::Tag {
+                    self.accept_schedule_sync(sync, now_ms)?;
+                }
+                Ok(Some(RangingEvent::ScheduleSyncReceived(short_address)))
             }
             Frame::RangingInit(init) if self.role == Role::Tag => {
                 let Some(short_address) = self.accept_ranging_init(init, now_ms)? else {
@@ -1017,7 +1283,7 @@ impl<const N: usize> RangingNode<N> {
                         .map_err(|_| ProtocolError::PeerTableFull)?;
                 }
                 if self.poll_acknowledged.len() == self.peers.len() {
-                    self.expected = FrameKind::RangeReport;
+                    self.begin_range_report_phase(now_ms);
                     self.send_range_async(radio, None).await?;
                 }
                 Ok(None)
@@ -1092,7 +1358,7 @@ impl<const N: usize> RangingNode<N> {
                     return Ok(None);
                 }
                 let range_filter = self.config.range_filter;
-                let snapshot = {
+                let (short_address, snapshot) = {
                     let Some(peer) = self.peer_mut(peer_short) else {
                         return Ok(None);
                     };
@@ -1109,8 +1375,16 @@ impl<const N: usize> RangingNode<N> {
                     peer.metrics.first_path_power_dbm = frame.metrics.first_path_power_dbm;
                     peer.metrics.quality = frame.metrics.quality;
                     peer.last_activity_ms = now_ms;
-                    PeerSnapshot::from(&*peer)
+                    (peer.short_address, PeerSnapshot::from(&*peer))
                 };
+                if !self.range_report_received.contains(&short_address) {
+                    self.range_report_received
+                        .push(short_address)
+                        .map_err(|_| ProtocolError::PeerTableFull)?;
+                }
+                if self.range_report_received.len() >= self.poll_acknowledged.len() {
+                    self.reset_protocol_state();
+                }
                 Ok(Some(RangingEvent::RangeUpdated(snapshot)))
             }
             Frame::RangeFailed { header } if self.role == Role::Tag => {
@@ -1136,6 +1410,10 @@ impl<const N: usize> RangingNode<N> {
     where
         R: AsyncRangingRadio<SpiE, PinE>,
     {
+        if self.finish_timed_out_session_async(radio, now_ms).await? {
+            return Ok(None);
+        }
+
         if let Some(position) = self.peers.iter().position(|peer| {
             now_ms.saturating_sub(peer.last_activity_ms) > self.config.reset_period_ms
         }) {
@@ -1149,14 +1427,28 @@ impl<const N: usize> RangingNode<N> {
         }
         self.last_tick_ms = now_ms;
 
-        if self.role == Role::Tag {
+        if self.session_active() {
+            return Ok(None);
+        }
+
+        if self.role == Role::Anchor {
+            if self.config.anchor_is_coordinator
+                && now_ms.wrapping_sub(self.last_range_start_ms)
+                    >= self.config.schedule.range_period_ms
+            {
+                self.last_range_start_ms = now_ms;
+                self.send_schedule_sync_async(radio, now_ms).await?;
+            }
+        } else if self.tag_slot_is_open(now_ms)
+            && now_ms.wrapping_sub(self.last_range_start_ms) >= self.config.schedule.range_period_ms
+        {
             if !self.peers.is_empty() && self.blink_counter != 0 {
-                self.expected = FrameKind::PollAck;
-                self.poll_acknowledged.clear();
+                self.begin_poll_ack_phase(now_ms);
                 self.send_poll_async(radio, None).await?;
             } else {
                 self.send_blink_async(radio).await?;
             }
+            self.last_range_start_ms = now_ms;
             self.blink_counter = if self.blink_counter >= 20 {
                 0
             } else {
@@ -1164,6 +1456,31 @@ impl<const N: usize> RangingNode<N> {
             };
         }
         Ok(None)
+    }
+
+    async fn finish_timed_out_session_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        now_ms: u32,
+    ) -> Result<bool, Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        if !self.session_expired(now_ms) {
+            return Ok(false);
+        }
+        match (self.role, self.expected) {
+            (Role::Tag, FrameKind::PollAck) if !self.poll_acknowledged.is_empty() => {
+                self.begin_range_report_phase(now_ms);
+                self.send_range_async(radio, None).await?;
+                Ok(true)
+            }
+            (Role::Tag, FrameKind::PollAck | FrameKind::RangeReport) => {
+                self.reset_protocol_state();
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn send_blink_async<R, SpiE, PinE>(
@@ -1203,6 +1520,37 @@ impl<const N: usize> RangingNode<N> {
         )?;
         self.last_tx_kind = Some(FrameKind::RangingInit);
         self.last_tx_destination = destination_short;
+        radio
+            .transmit(
+                &frame[..len],
+                TxOptions {
+                    delayed_time: self.anchor_discovery_delay(),
+                    wait_for_response: false,
+                },
+            )
+            .await
+    }
+
+    async fn send_schedule_sync_async<R, SpiE, PinE>(
+        &mut self,
+        radio: &mut R,
+        now_ms: u32,
+    ) -> Result<(), Error<SpiE, PinE>>
+    where
+        R: AsyncRangingRadio<SpiE, PinE>,
+    {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_schedule_sync(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            ShortAddress::BROADCAST,
+            now_ms,
+            self.config.schedule.tag_slot_count,
+            self.config.schedule.tag_slot_ms,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::ScheduleSync);
+        self.last_tx_destination = ShortAddress::BROADCAST;
         radio.transmit(&frame[..len], TxOptions::default()).await
     }
 
@@ -1258,7 +1606,7 @@ impl<const N: usize> RangingNode<N> {
         &mut self,
         radio: &mut R,
         destination: ShortAddress,
-        reply_delay_us: u16,
+        reply_delay_us: u32,
     ) -> Result<(), Error<SpiE, PinE>>
     where
         R: AsyncRangingRadio<SpiE, PinE>,
@@ -1302,15 +1650,32 @@ impl<const N: usize> RangingNode<N> {
         let delay = DwTime::from_micros(self.config.reply_delay_us as f32);
         let range_sent = radio.compute_delayed_time(delay).await?;
         let count = if destination.is_broadcast() {
-            for (index, peer) in self.peers.iter().enumerate() {
-                timings[index] = RangeTiming {
-                    short_address: peer.short_address,
-                    poll_sent: peer.poll_sent,
-                    poll_ack_received: peer.poll_ack_received,
-                    range_sent,
-                };
+            if self.poll_acknowledged.is_empty() {
+                for (index, peer) in self.peers.iter().enumerate() {
+                    timings[index] = RangeTiming {
+                        short_address: peer.short_address,
+                        poll_sent: peer.poll_sent,
+                        poll_ack_received: peer.poll_ack_received,
+                        range_sent,
+                    };
+                }
+                self.peers.len()
+            } else {
+                let mut count = 0;
+                for index in 0..self.poll_acknowledged.len() {
+                    let short = self.poll_acknowledged[index];
+                    if let Some(peer) = self.peer(short) {
+                        timings[count] = RangeTiming {
+                            short_address: peer.short_address,
+                            poll_sent: peer.poll_sent,
+                            poll_ack_received: peer.poll_ack_received,
+                            range_sent,
+                        };
+                        count += 1;
+                    }
+                }
+                count
             }
-            self.peers.len()
         } else {
             let peer = self.peer(destination).ok_or(ProtocolError::UnknownPeer)?;
             timings[0] = RangeTiming {
@@ -1346,7 +1711,7 @@ impl<const N: usize> RangingNode<N> {
         radio: &mut R,
         destination: ShortAddress,
         payload: RangeReportPayload,
-        reply_delay_us: u16,
+        reply_delay_us: u32,
     ) -> Result<(), Error<SpiE, PinE>>
     where
         R: AsyncRangingRadio<SpiE, PinE>,
@@ -1404,16 +1769,15 @@ fn filtered_range(range_filter: Option<u16>, previous: f32, distance: f32) -> f3
     distance
 }
 
-fn scheduled_reply_delay_us(base_reply_delay_us: u16, index: usize) -> Result<u16, ProtocolError> {
+fn scheduled_reply_delay_us(base_reply_delay_us: u32, index: usize) -> Result<u32, ProtocolError> {
     let slot = index
         .checked_mul(2)
         .and_then(|value| value.checked_add(1))
         .ok_or(ProtocolError::ReplyDelayOverflow)?;
     let multiplier = u32::try_from(slot).map_err(|_| ProtocolError::ReplyDelayOverflow)?;
-    let delay = u32::from(base_reply_delay_us)
+    base_reply_delay_us
         .checked_mul(multiplier)
-        .ok_or(ProtocolError::ReplyDelayOverflow)?;
-    u16::try_from(delay).map_err(|_| ProtocolError::ReplyDelayOverflow)
+        .ok_or(ProtocolError::ReplyDelayOverflow)
 }
 
 fn observe_peer_sequence(peer: &mut Peer, sequence: u8) -> bool {

@@ -250,7 +250,7 @@ where
         Ok(sys_status_from_bytes(&bytes))
     }
 
-    /// Clears the selected `SYS_STATUS` bits.
+    /// Clears the selected `SYS_STATUS` bits and re-arms permanent receive after RX/TX completion.
     pub fn clear_events(&mut self, event_mask: SysStatus) -> Result<(), Error<SPI::Error, PinE>> {
         self.write_register(
             Register::SysStatus,
