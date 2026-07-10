@@ -103,9 +103,11 @@ let frame = radio.read_frame(&mut buffer).await?;
 For tag/anchor exchanges, use `RangingNode` on top of the driver:
 
 ```rust
-use dw1000_rs::{RangingConfig, RangingEvent, RangingNode, Role};
+use dw1000_rs::{RangingConfig, RangingEvent, RangingNode, RangingSchedule, Role};
 
-let mut node = RangingNode::<4>::new(Role::Tag, RangingConfig::new(identity));
+let mut config = RangingConfig::new(identity);
+config.schedule = RangingSchedule::new();
+let mut node = RangingNode::<4>::new(Role::Tag, config);
 let mut rx_buffer = [0u8; 127];
 
 node.start(&mut radio, now_ms)?;
