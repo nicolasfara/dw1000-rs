@@ -5,14 +5,14 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 
 use dw1000_rs::protocol::{
-    detect_frame_kind, encode_poll_ack, encode_range_report, encode_ranging_init, FrameKind,
-    RangeReportPayload,
+    decode_poll_targets, decode_range_timings, detect_frame_kind, encode_discovery_blink,
+    encode_poll_ack, encode_range_report, encode_ranging_init, encode_schedule_sync, parse_frame,
+    Frame, FrameKind, PollTarget, RangeReportPayload, RangeTiming,
 };
 use dw1000_rs::ranging::RangingRadio;
 use dw1000_rs::{
-    DeviceIdentity, DwTime, Error, Eui64, PanId, ProtocolError, RangingConfig, RangingEvent,
-    RangingNode, Role, RxFrame, RxOptions, ShortAddress, SignalMetrics, SysStatus, Timestamps,
-    TxOptions,
+    DeviceIdentity, DwTime, Error, Eui64, PanId, RangingConfig, RangingEvent, RangingNode, Role,
+    RxFrame, RxOptions, ShortAddress, SignalMetrics, SysStatus, Timestamps, TxOptions,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +178,197 @@ fn single_tag_anchor_exchange_completes() {
     let expected_range = DwTime::from_ticks(20).as_meters();
     assert!((anchor_snapshot.range_m - expected_range).abs() < 1e-6);
     assert!((tag_snapshot.range_m - expected_range).abs() < 1e-6);
+}
+
+#[test]
+fn secondary_anchor_observes_coordinator_sync_without_adding_a_peer() {
+    let coordinator_identity = identity(0x3344, [0xB1, 0x4A, 0x7C, 0x00, 0x11, 0x22, 0x33, 0x44]);
+    let secondary_identity = identity(0x3345, [0xB1, 0x4A, 0x7C, 0x00, 0x11, 0x22, 0x33, 0x45]);
+    let mut secondary = RangingNode::<4>::new(Role::Anchor, RangingConfig::new(secondary_identity));
+    let mut radio = MockRadio::default();
+    let mut sync = [0u8; 127];
+    let len = encode_schedule_sync(
+        1,
+        coordinator_identity.short_address,
+        ShortAddress::BROADCAST,
+        80,
+        1,
+        250,
+        &mut sync,
+    )
+    .unwrap();
+
+    secondary.start(&mut radio, 0).unwrap();
+    radio.push_rx(&sync[..len], DwTime::from_ticks(10), metrics());
+
+    assert_eq!(
+        secondary.on_rx(&mut radio, 81, &mut [0u8; 127]).unwrap(),
+        Some(RangingEvent::ScheduleSyncReceived(
+            coordinator_identity.short_address
+        ))
+    );
+    assert_eq!(secondary.peers().count(), 0);
+    assert!(radio.transmitted.is_empty());
+}
+
+#[test]
+fn discovery_response_uses_the_configured_anchor_slot_delay() {
+    let tag_identity = identity(0x3400, [1, 2, 3, 4, 5, 6, 7, 8]);
+    let anchor_identity = identity(0x3345, [9, 10, 11, 12, 13, 14, 15, 16]);
+    let mut config = RangingConfig::new(anchor_identity);
+    config.schedule.anchor_slot = 1;
+    config.schedule.discovery_slot_spacing_us = 12_000;
+    let mut anchor = RangingNode::<4>::new(Role::Anchor, config);
+    let mut radio = MockRadio::default();
+    let mut blink = [0u8; 127];
+    let blink_len =
+        encode_discovery_blink(0, tag_identity.eui, tag_identity.short_address, &mut blink)
+            .unwrap();
+
+    anchor.start(&mut radio, 0).unwrap();
+    radio.push_rx(&blink[..blink_len], DwTime::from_ticks(10), metrics());
+    anchor.on_rx(&mut radio, 1, &mut [0u8; 127]).unwrap();
+
+    assert_eq!(
+        radio.transmitted[0].1.delayed_time,
+        Some(DwTime::from_micros(12_000.0))
+    );
+}
+
+#[test]
+fn four_anchor_exchange_completes() {
+    let tag_identity = identity(0x1234, [0x7D, 0x00, 0x22, 0xEA, 0x82, 0x60, 0x3B, 0x9C]);
+    let anchor_identities = [
+        identity(0x4001, [0x10, 0x17, 0x5B, 0xD5, 0xA9, 0x9A, 0xE2, 0x91]),
+        identity(0x4002, [0x20, 0x17, 0x5B, 0xD5, 0xA9, 0x9A, 0xE2, 0x92]),
+        identity(0x4003, [0x30, 0x17, 0x5B, 0xD5, 0xA9, 0x9A, 0xE2, 0x93]),
+        identity(0x4004, [0x40, 0x17, 0x5B, 0xD5, 0xA9, 0x9A, 0xE2, 0x94]),
+    ];
+    let mut tag_config = RangingConfig::new(tag_identity);
+    tag_config.reply_delay_us = 12_000;
+    tag_config.schedule.session_timeout_ms = 200;
+    let mut tag = RangingNode::<4>::new(Role::Tag, tag_config);
+    let mut anchors = [
+        RangingNode::<4>::new(Role::Anchor, RangingConfig::new(anchor_identities[0])),
+        RangingNode::<4>::new(Role::Anchor, RangingConfig::new(anchor_identities[1])),
+        RangingNode::<4>::new(Role::Anchor, RangingConfig::new(anchor_identities[2])),
+        RangingNode::<4>::new(Role::Anchor, RangingConfig::new(anchor_identities[3])),
+    ];
+    let mut tag_radio = MockRadio::default();
+    let mut anchor_radios = [
+        MockRadio::default(),
+        MockRadio::default(),
+        MockRadio::default(),
+        MockRadio::default(),
+    ];
+
+    tag.start(&mut tag_radio, 0).unwrap();
+    for (index, anchor) in anchors.iter_mut().enumerate() {
+        anchor.start(&mut anchor_radios[index], 0).unwrap();
+    }
+
+    tag.tick(&mut tag_radio, 80).unwrap();
+    let blink = tag_radio.last_tx().to_vec();
+    for (index, anchor) in anchors.iter_mut().enumerate() {
+        anchor_radios[index].push_rx(&blink, DwTime::from_ticks(10 + index as i64), metrics());
+        anchor
+            .on_rx(
+                &mut anchor_radios[index],
+                81 + index as u32,
+                &mut [0u8; 127],
+            )
+            .unwrap();
+    }
+    for (index, radio) in anchor_radios.iter().enumerate() {
+        tag_radio.push_rx(
+            radio.last_tx(),
+            DwTime::from_ticks(20 + index as i64),
+            metrics(),
+        );
+        assert!(matches!(
+            tag.on_rx(&mut tag_radio, 90 + index as u32, &mut [0u8; 127])
+                .unwrap(),
+            Some(RangingEvent::RangingInitReceived(_))
+        ));
+    }
+
+    tag.tick(&mut tag_radio, 160).unwrap();
+    tag_radio.next_timestamps.push_back(Timestamps {
+        tx: DwTime::from_ticks(100),
+        rx: DwTime::zero(),
+        system: DwTime::zero(),
+    });
+    tag.on_tx_done(&mut tag_radio).unwrap();
+    let poll = tag_radio.last_tx().to_vec();
+    for (index, anchor) in anchors.iter_mut().enumerate() {
+        anchor_radios[index].push_rx(&poll, DwTime::from_ticks(120 + index as i64), metrics());
+        anchor
+            .on_rx(
+                &mut anchor_radios[index],
+                170 + index as u32,
+                &mut [0u8; 127],
+            )
+            .unwrap();
+        anchor_radios[index].next_timestamps.push_back(Timestamps {
+            tx: DwTime::from_ticks(180 + index as i64),
+            rx: DwTime::zero(),
+            system: DwTime::zero(),
+        });
+        anchor.on_tx_done(&mut anchor_radios[index]).unwrap();
+    }
+
+    tag_radio.delayed_times.push_back(DwTime::from_ticks(260));
+    for (index, radio) in anchor_radios.iter().enumerate() {
+        tag_radio.push_rx(
+            radio.last_tx(),
+            DwTime::from_ticks(200 + index as i64),
+            metrics(),
+        );
+        tag.on_rx(&mut tag_radio, 190 + index as u32, &mut [0u8; 127])
+            .unwrap();
+    }
+    assert_eq!(
+        detect_frame_kind(tag_radio.last_tx()).unwrap(),
+        FrameKind::Range
+    );
+
+    tag_radio.next_timestamps.push_back(Timestamps {
+        tx: DwTime::from_ticks(260),
+        rx: DwTime::zero(),
+        system: DwTime::zero(),
+    });
+    tag.on_tx_done(&mut tag_radio).unwrap();
+    let range = tag_radio.last_tx().to_vec();
+    for (index, anchor) in anchors.iter_mut().enumerate() {
+        anchor_radios[index].push_rx(&range, DwTime::from_ticks(280 + index as i64), metrics());
+        assert!(matches!(
+            anchor
+                .on_rx(
+                    &mut anchor_radios[index],
+                    220 + index as u32,
+                    &mut [0u8; 127]
+                )
+                .unwrap(),
+            Some(RangingEvent::RangeUpdated(_))
+        ));
+    }
+
+    let mut reports = 0;
+    for (index, radio) in anchor_radios.iter().enumerate() {
+        tag_radio.push_rx(
+            radio.last_tx(),
+            DwTime::from_ticks(300 + index as i64),
+            metrics(),
+        );
+        if matches!(
+            tag.on_rx(&mut tag_radio, 260 + index as u32, &mut [0u8; 127])
+                .unwrap(),
+            Some(RangingEvent::RangeUpdated(_))
+        ) {
+            reports += 1;
+        }
+    }
+    assert_eq!(reports, 4);
 }
 
 #[test]
@@ -479,31 +670,139 @@ fn stale_poll_ack_is_ignored_while_waiting_for_range_report() {
 }
 
 #[test]
-fn broadcast_poll_reports_reply_delay_overflow() {
+fn missing_poll_ack_times_out_and_ranges_only_acknowledged_anchor() {
     let tag_identity = identity(0x1234, [33, 34, 35, 36, 37, 38, 39, 40]);
     let anchor_a = identity(0x4001, [41, 42, 43, 44, 45, 46, 47, 48]);
     let anchor_b = identity(0x4002, [49, 50, 51, 52, 53, 54, 55, 56]);
     let mut config = RangingConfig::new(tag_identity);
-    config.reply_delay_us = 40_000;
-
-    let mut tag = RangingNode::<2>::new(Role::Tag, config);
+    config.schedule.session_timeout_ms = 20;
+    let mut tag = RangingNode::<4>::new(Role::Tag, config);
     let mut radio = MockRadio::default();
 
     tag.start(&mut radio, 0).unwrap();
     tag.tick(&mut radio, 80).unwrap();
 
-    let mut init = [0u8; 127];
-    let init_len =
-        encode_ranging_init(0, anchor_a.short_address, tag_identity.eui, &mut init).unwrap();
-    radio.push_rx(&init[..init_len], DwTime::from_ticks(20), metrics());
-    tag.on_rx(&mut radio, 81, &mut [0u8; 127]).unwrap();
+    for anchor in [anchor_a, anchor_b] {
+        let mut init = [0u8; 127];
+        let init_len =
+            encode_ranging_init(0, anchor.short_address, tag_identity.eui, &mut init).unwrap();
+        radio.push_rx(&init[..init_len], DwTime::from_ticks(20), metrics());
+        tag.on_rx(&mut radio, 81, &mut [0u8; 127]).unwrap();
+    }
 
-    let mut init = [0u8; 127];
-    let init_len =
-        encode_ranging_init(0, anchor_b.short_address, tag_identity.eui, &mut init).unwrap();
-    radio.push_rx(&init[..init_len], DwTime::from_ticks(21), metrics());
-    tag.on_rx(&mut radio, 82, &mut [0u8; 127]).unwrap();
+    tag.tick(&mut radio, 160).unwrap();
+    radio.next_timestamps.push_back(Timestamps {
+        tx: DwTime::from_ticks(100),
+        rx: DwTime::zero(),
+        system: DwTime::zero(),
+    });
+    tag.on_tx_done(&mut radio).unwrap();
 
-    let error = tag.tick(&mut radio, 160).unwrap_err();
-    assert_eq!(error, Error::Protocol(ProtocolError::ReplyDelayOverflow));
+    let mut poll_ack = [0u8; 127];
+    let poll_ack_len = encode_poll_ack(
+        1,
+        anchor_a.short_address,
+        tag_identity.short_address,
+        &mut poll_ack,
+    )
+    .unwrap();
+    radio.push_rx(
+        &poll_ack[..poll_ack_len],
+        DwTime::from_ticks(200),
+        metrics(),
+    );
+    tag.on_rx(&mut radio, 161, &mut [0u8; 127]).unwrap();
+
+    radio.delayed_times.push_back(DwTime::from_ticks(260));
+    tag.tick(&mut radio, 181).unwrap();
+    let Frame::Range { payload, .. } = parse_frame(radio.last_tx()).unwrap() else {
+        panic!("expected range frame");
+    };
+    let mut timings = [RangeTiming {
+        short_address: ShortAddress::new(0),
+        poll_sent: DwTime::zero(),
+        poll_ack_received: DwTime::zero(),
+        range_sent: DwTime::zero(),
+    }; 4];
+    let count = decode_range_timings(payload, &mut timings).unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(timings[0].short_address, anchor_a.short_address);
+}
+
+#[test]
+fn two_tags_use_distinct_tdma_slots() {
+    let mut slot0_config = RangingConfig::new(identity(0x3400, [1, 1, 1, 1, 1, 1, 1, 1]));
+    slot0_config.schedule.tag_slot = 0;
+    slot0_config.schedule.tag_slot_count = 2;
+    slot0_config.schedule.tag_slot_ms = 100;
+
+    let mut slot1_config = RangingConfig::new(identity(0x3401, [2, 2, 2, 2, 2, 2, 2, 2]));
+    slot1_config.schedule.tag_slot = 1;
+    slot1_config.schedule.tag_slot_count = 2;
+    slot1_config.schedule.tag_slot_ms = 100;
+
+    let mut slot0 = RangingNode::<4>::new(Role::Tag, slot0_config);
+    let mut slot1 = RangingNode::<4>::new(Role::Tag, slot1_config);
+    let mut slot0_radio = MockRadio::default();
+    let mut slot1_radio = MockRadio::default();
+
+    slot0.start(&mut slot0_radio, 0).unwrap();
+    slot1.start(&mut slot1_radio, 0).unwrap();
+
+    slot0.tick(&mut slot0_radio, 80).unwrap();
+    slot1.tick(&mut slot1_radio, 80).unwrap();
+    assert_eq!(slot0_radio.transmitted.len(), 1);
+    assert_eq!(slot1_radio.transmitted.len(), 0);
+
+    slot0.tick(&mut slot0_radio, 160).unwrap();
+    slot1.tick(&mut slot1_radio, 160).unwrap();
+    assert_eq!(slot0_radio.transmitted.len(), 1);
+    assert_eq!(slot1_radio.transmitted.len(), 1);
+}
+
+#[test]
+fn broadcast_poll_schedules_four_anchors_without_overflow() {
+    let tag_identity = identity(0x1234, [33, 34, 35, 36, 37, 38, 39, 40]);
+    let anchors = [
+        identity(0x4001, [41, 42, 43, 44, 45, 46, 47, 48]),
+        identity(0x4002, [49, 50, 51, 52, 53, 54, 55, 56]),
+        identity(0x4003, [57, 58, 59, 60, 61, 62, 63, 64]),
+        identity(0x4004, [65, 66, 67, 68, 69, 70, 71, 72]),
+    ];
+    let mut config = RangingConfig::new(tag_identity);
+    config.reply_delay_us = 12_000;
+
+    let mut tag = RangingNode::<4>::new(Role::Tag, config);
+    let mut radio = MockRadio::default();
+
+    tag.start(&mut radio, 0).unwrap();
+    tag.tick(&mut radio, 80).unwrap();
+
+    for (index, anchor) in anchors.iter().enumerate() {
+        let mut init = [0u8; 127];
+        let init_len =
+            encode_ranging_init(0, anchor.short_address, tag_identity.eui, &mut init).unwrap();
+        radio.push_rx(
+            &init[..init_len],
+            DwTime::from_ticks(20 + index as i64),
+            metrics(),
+        );
+        tag.on_rx(&mut radio, 81 + index as u32, &mut [0u8; 127])
+            .unwrap();
+    }
+
+    tag.tick(&mut radio, 160).unwrap();
+    let Frame::Poll { payload, .. } = parse_frame(radio.last_tx()).unwrap() else {
+        panic!("expected poll frame");
+    };
+    let mut targets = [PollTarget {
+        short_address: ShortAddress::new(0),
+        reply_delay_us: 0,
+    }; 4];
+    let count = decode_poll_targets(payload, &mut targets).unwrap();
+    assert_eq!(count, 4);
+    assert_eq!(
+        targets.map(|target| target.reply_delay_us),
+        [12_000, 36_000, 60_000, 84_000]
+    );
 }

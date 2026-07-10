@@ -262,6 +262,30 @@ fn clear_tx_sent_restarts_receive_when_permanent_mode_is_enabled() {
 }
 
 #[test]
+fn clear_rx_ready_restarts_receive_when_permanent_mode_is_enabled() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let spi = RecordingSpi::new(log.clone(), VecDeque::new());
+    let mut driver = Dw1000::new(spi, MockInputPin, MockOutputPin);
+
+    driver
+        .start_receive(RxOptions {
+            delayed_time: None,
+            permanent: true,
+        })
+        .unwrap();
+    driver
+        .clear_events(dw1000_rs::registers::status::RX_FRAME_READY)
+        .unwrap();
+
+    let transactions = log.lock().unwrap();
+    let restart_count = transactions
+        .iter()
+        .filter(|transaction| transaction.writes == vec![vec![0x8D], vec![0x00, 0x01, 0x00, 0x00]])
+        .count();
+    assert_eq!(restart_count, 2);
+}
+
+#[test]
 fn clearing_rx_event_does_not_cancel_pending_delayed_tx() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let spi = RecordingSpi::new(log.clone(), VecDeque::new());

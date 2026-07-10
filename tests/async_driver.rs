@@ -302,3 +302,24 @@ fn async_clear_tx_sent_restarts_receive_when_permanent_mode_is_enabled() {
         .count();
     assert_eq!(restart_count, 2);
 }
+
+#[test]
+fn async_clear_rx_ready_restarts_receive_when_permanent_mode_is_enabled() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let spi = RecordingAsyncSpi::new(log.clone(), VecDeque::new());
+    let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
+
+    block_on(driver.start_receive(RxOptions {
+        delayed_time: None,
+        permanent: true,
+    }))
+    .unwrap();
+    block_on(driver.clear_events(dw1000_rs::registers::status::RX_FRAME_READY)).unwrap();
+
+    let transactions = log.lock().unwrap();
+    let restart_count = transactions
+        .iter()
+        .filter(|transaction| transaction.writes == vec![vec![0x8D], vec![0x00, 0x01, 0x00, 0x00]])
+        .count();
+    assert_eq!(restart_count, 2);
+}
