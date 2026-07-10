@@ -28,7 +28,6 @@ embedded-hal-async = "1.0.0"
 defmt = { version = "0.3", optional = true }
 libm = "0.2"
 heapless = "0.9.1"
-rand_core = "0.9.3"
 
 [features]
 default = []

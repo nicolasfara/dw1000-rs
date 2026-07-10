@@ -7,7 +7,6 @@
 
 pub mod async_dw1000;
 pub mod config;
-pub mod constants;
 mod device;
 mod driver_core;
 pub mod dw1000;
@@ -25,5 +24,5 @@ pub use device::{
 };
 pub use dw1000::Dw1000;
 pub use error::{Error, ProtocolError, RxError};
-pub use ranging::{RangingConfig, RangingEvent, RangingNode, RangingSchedule, Role};
-pub use time::{DW1000Time, DwTime};
+pub use ranging::{RangingConfig, RangingEvent, RangingNode, Role};
+pub use time::{DW1000Time, DelayedTime, DwTime};

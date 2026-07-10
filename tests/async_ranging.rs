@@ -11,8 +11,9 @@ use dw1000_rs::protocol::{
 };
 use dw1000_rs::ranging::AsyncRangingRadio;
 use dw1000_rs::{
-    DeviceIdentity, DwTime, Error, Eui64, PanId, RangingConfig, RangingEvent, RangingNode, Role,
-    RxFrame, RxOptions, ShortAddress, SignalMetrics, SysStatus, Timestamps, TxOptions,
+    DelayedTime, DeviceIdentity, DwTime, Error, Eui64, PanId, ProtocolError, RangingConfig,
+    RangingEvent, RangingNode, Role, RxFrame, RxOptions, ShortAddress, SignalMetrics, SysStatus,
+    Timestamps, TxOptions,
 };
 use futures::executor::block_on;
 
@@ -85,11 +86,12 @@ impl AsyncRangingRadio<MockError, MockError> for MockRadio {
         Ok(self.next_timestamps.pop_front().unwrap())
     }
 
-    async fn compute_delayed_time(
+    async fn schedule_delayed(
         &mut self,
-        _delay: DwTime,
-    ) -> Result<DwTime, Error<MockError, MockError>> {
-        Ok(self.delayed_times.pop_front().unwrap())
+        delay: DwTime,
+    ) -> Result<DelayedTime, Error<MockError, MockError>> {
+        let time = self.delayed_times.pop_front().unwrap_or(delay);
+        Ok(DelayedTime::new(time, time))
     }
 }
 

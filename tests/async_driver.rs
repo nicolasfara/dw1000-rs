@@ -201,7 +201,7 @@ fn async_reconfigure_programs_identity_registers() {
 }
 
 #[test]
-fn async_compute_delayed_time_aligns_timestamp_and_applies_antenna_delay() {
+fn async_schedule_delayed_aligns_timestamp_and_predicts_tx() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let spi = RecordingAsyncSpi::new(
         log,
@@ -210,19 +210,31 @@ fn async_compute_delayed_time_aligns_timestamp_and_applies_antenna_delay() {
     let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
 
     let delay = DwTime::from_micros(7000.0);
-    let computed = block_on(driver.compute_delayed_time(delay)).unwrap();
+    let scheduled = block_on(driver.schedule_delayed(delay)).unwrap();
 
     let mut expected = DwTime::from_bytes(&[0x34, 0x12, 0x00, 0x00, 0x00]) + delay;
     let mut bytes = expected.to_bytes();
     bytes[0] = 0;
     bytes[1] &= 0xFE;
-    expected = DwTime::from_bytes(&bytes) + DwTime::from_ticks(16_456);
-    assert_eq!(computed, expected);
+    expected = DwTime::from_bytes(&bytes);
+    assert_eq!(scheduled.dx_time(), expected);
+    assert_eq!(
+        scheduled.predicted_tx_timestamp(),
+        expected + DwTime::from_ticks(16_456)
+    );
 }
 
 #[test]
 fn async_read_frame_reads_payload_and_metrics() {
     let log = Arc::new(Mutex::new(Vec::new()));
+    let mut rx_time = vec![0u8; 14];
+    rx_time[0] = 0x10; // RX_STAMP low byte
+    rx_time[7] = 0x02; // FP_AMPL1
+    let mut rx_fqual = vec![0u8; 8];
+    rx_fqual[0] = 0x20; // STD_NOISE
+    rx_fqual[2] = 0x03; // FP_AMPL2
+    rx_fqual[4] = 0x04; // FP_AMPL3
+    rx_fqual[6] = 0x40; // CIR_PWR
     let reads = VecDeque::from(vec![
         vec![0; 4],
         dw1000_rs::registers::sys_status_to_bytes(SysStatus(
@@ -232,15 +244,8 @@ fn async_read_frame_reads_payload_and_metrics() {
         .to_vec(),
         vec![0x07, 0x00, 0x00, 0x00],
         vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
-        vec![0x10, 0x00, 0x00, 0x00, 0x00],
-        vec![0x20, 0x00],
-        vec![0x40, 0x00, 0x00, 0x00],
-        vec![0x02, 0x00],
-        vec![0x03, 0x00],
-        vec![0x04, 0x00],
-        vec![0x40, 0x00, 0x00, 0x00],
-        vec![0x02, 0x00],
-        vec![0x03, 0x00],
+        rx_time,
+        rx_fqual,
     ]);
     let spi = RecordingAsyncSpi::new(log, reads);
     let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);

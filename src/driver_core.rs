@@ -10,22 +10,43 @@ use crate::device::{AntennaDelay, DeviceIdentity, SysStatus};
 use crate::error::RxError;
 use crate::registers::status;
 use crate::registers::{
-    Register, DIS_DRXB_BIT, DIS_STXP_BIT, DWSFD_BIT, HIRQ_POL_BIT, LEN_RX_FINFO, LEN_SYS_MASK,
-    MLDEERR_BIT, MRXDFR_BIT, MRXFCE_BIT, MRXFCG_BIT, MRXFSL_BIT, MRXPHE_BIT, MTXFRS_BIT,
+    Register, BLNKEN_BIT, DIS_DRXB_BIT, DIS_STXP_BIT, DWSFD_BIT, GPDCE_BIT, GPIO_MODE_GPIO,
+    GPIO_MODE_LED, HIRQ_POL_BIT, KHZCLKEN_BIT, LEN_CHAN_CTRL, LEN_PANADR, LEN_RX_FINFO,
+    LEN_RX_FQUAL, LEN_RX_TIME, LEN_SYS_CFG, LEN_SYS_MASK, LEN_TX_ANTD, LEN_TX_FCTRL, MAFFREJ_BIT,
+    MLDEERR_BIT, MRXDFR_BIT, MRXFCE_BIT, MRXFCG_BIT, MRXFSL_BIT, MRXPHE_BIT, MRXPTO_BIT,
+    MRXRFTO_BIT, MRXSFDTO_BIT, MSGP0_BIT, MSGP1_BIT, MSGP2_BIT, MSGP3_BIT, MTXFRS_BIT,
     NO_SUBADDRESS, RNSSFD_BIT, RXAUTR_BIT, RXDLYS_BIT, RXENAB_BIT, RXM110K_BIT, SFCST_BIT,
-    SYS_MASK_BIT3, TNSSFD_BIT, TRXOFF_BIT, TXDLYS_BIT, TXSTRT_BIT, WAIT4RESP_BIT,
+    TNSSFD_BIT, TRXOFF_BIT, TXDLYS_BIT, TXSTRT_BIT, WAIT4RESP_BIT,
 };
-use crate::time::{DwTime, DISTANCE_PER_TICK_M};
+use crate::registers::{
+    AGC_TUNE1_SUB, AGC_TUNE2_SUB, AGC_TUNE3_SUB, DRX_SFDTOC_SUB, DRX_TUNE0B_SUB, DRX_TUNE1A_SUB,
+    DRX_TUNE1B_SUB, DRX_TUNE2_SUB, DRX_TUNE4H_SUB, FS_PLLCFG_SUB, FS_PLLTUNE_SUB, FS_XTALT_SUB,
+    LDE_CFG1_SUB, LDE_CFG2_SUB, LDE_REPC_SUB, LDE_RXANTD_SUB, RF_RXCTRLH_SUB, RF_TXCTRL_SUB,
+    SFD_LENGTH_SUB, TC_PGDELAY_SUB,
+};
+use crate::device::SignalMetrics;
+use crate::time::{DelayedTime, DwTime, DISTANCE_PER_TICK_M};
 
 pub(crate) const LEN_UWB_FRAMES: usize = 127;
 
-const RECEIVE_RESTART_EVENTS: u64 = status::RX_FRAME_READY.0
-    | status::RX_FRAME_GOOD.0
-    | status::RX_FRAME_CHECK_ERROR.0
-    | status::RX_REED_SOLOMON_ERROR.0
-    | status::RX_TIMEOUT.0
-    | status::RX_HEADER_ERROR.0
-    | status::LDE_ERROR.0;
+/// LDE_CFG1 value from the official driver: PEAK_MULTPLIER (0x60) | N_STD_FACTOR (13).
+pub(crate) const LDE_CFG1_VALUE: u8 = 0x6D;
+/// Subaddress of the upper SYS_STATUS bytes used for late delayed-TX/RX checks.
+pub(crate) const SYS_STATUS_HI_SUB: u16 = 0x03;
+/// HPDWARN | TXPUTE in the 16-bit word at SYS_STATUS offset 3 (`SYS_STATUS_TXERR`).
+pub(crate) const DELAYED_TX_LATE_MASK: u16 = 0x0408;
+/// HPDWARN in the byte at SYS_STATUS offset 3.
+pub(crate) const HPDWARN_HI_BIT: u8 = 0x08;
+/// PMSC SOFTRESET value that holds the receiver in reset.
+pub(crate) const PMSC_SOFTRESET_RX: u8 = 0xE0;
+/// PMSC SOFTRESET value that releases all reset lines.
+pub(crate) const PMSC_SOFTRESET_CLEAR: u8 = 0xF0;
+/// OTP address of the factory LDO tune value.
+pub(crate) const OTP_ADDRESS_LDOTUNE: u16 = 0x004;
+/// OTP address of the factory crystal trim value.
+pub(crate) const OTP_ADDRESS_XTAL_TRIM: u16 = 0x01E;
+/// OTP_SF value that kicks the LDO tune load from OTP.
+pub(crate) const OTP_SF_LDO_KICK: u8 = 0x02;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClockMode {
@@ -55,6 +76,9 @@ pub(crate) struct DriverRuntime {
     pub(crate) phy: Option<ValidatedPhyConfig>,
     pub(crate) identity: Option<DeviceIdentity>,
     pub(crate) rx_after_tx_pending: bool,
+    /// Raw crystal-trim OTP value captured during init while the XTI clock is
+    /// forced (OTP reads are only reliable under XTI).
+    pub(crate) xtal_trim: Option<u8>,
 }
 
 impl DriverRuntime {
@@ -67,6 +91,7 @@ impl DriverRuntime {
             phy: None,
             identity: None,
             rx_after_tx_pending: false,
+            xtal_trim: None,
         }
     }
 
@@ -102,8 +127,20 @@ impl DriverRuntime {
         if status.contains(status::RX_REED_SOLOMON_ERROR) {
             return Err(RxError::ReedSolomon);
         }
+        if status.contains(status::RX_SFD_TIMEOUT) {
+            return Err(RxError::SfdTimeout);
+        }
+        if status.contains(status::RX_OVERRUN) {
+            return Err(RxError::Overrun);
+        }
+        if status.contains(status::FRAME_FILTER_REJECTION) {
+            return Err(RxError::FrameFiltered);
+        }
         if status.contains(status::RX_TIMEOUT) {
             return Err(RxError::Timeout);
+        }
+        if status.contains(status::RX_PREAMBLE_TIMEOUT) {
+            return Err(RxError::PreambleTimeout);
         }
         if !status.contains(status::RX_FRAME_READY) {
             return Err(RxError::FrameNotReady);
@@ -112,20 +149,27 @@ impl DriverRuntime {
     }
 
     pub(crate) fn rx_payload_len(&self, rx_finfo: [u8; LEN_RX_FINFO]) -> usize {
-        let mut len = (((rx_finfo[1] as usize) << 8) | rx_finfo[0] as usize) & 0x03FF;
+        // Standard PHR mode: 7-bit frame length (long frames are never enabled).
+        let mut len = (rx_finfo[0] & 0x7F) as usize;
         if self.frame_check && len > 2 {
             len -= 2;
         }
         len
     }
 
-    pub(crate) fn compute_delayed_time(&self, system_time: DwTime) -> DwTime {
-        let mut future = system_time;
-        let mut bytes = future.to_bytes();
+    /// Computes the delayed activation time for TX/RX.
+    ///
+    /// The DW1000 ignores the low 9 bits of `DX_TIME`, so they are zeroed to
+    /// make the programmed time exact. The antenna delay is *not* added here:
+    /// the chip reports `TX_STAMP = DX_TIME + TX_ANTD`, so it only belongs to
+    /// the predicted transmit timestamp.
+    pub(crate) fn schedule_delayed(&self, now: DwTime, delay: DwTime) -> DelayedTime {
+        let mut bytes = (now + delay).to_bytes();
         bytes[0] = 0;
         bytes[1] &= 0xFE;
-        future = DwTime::from_bytes(&bytes);
-        future + DwTime::from_ticks(self.antenna_delay.raw() as i64)
+        let dx_time = DwTime::from_bytes(&bytes);
+        let predicted_tx = dx_time + DwTime::from_ticks(self.antenna_delay.raw() as i64);
+        DelayedTime::new(dx_time, predicted_tx)
     }
 
     pub(crate) fn correct_receive_timestamp(
@@ -249,25 +293,11 @@ pub(crate) const fn cleared_interrupt_mask() -> [u8; LEN_SYS_MASK] {
 }
 
 pub(crate) const fn receive_status_clear_mask() -> SysStatus {
-    SysStatus(
-        status::RX_FRAME_READY.0
-            | status::LDE_DONE.0
-            | status::LDE_ERROR.0
-            | status::RX_HEADER_ERROR.0
-            | status::RX_FRAME_CHECK_ERROR.0
-            | status::RX_FRAME_GOOD.0
-            | status::RX_REED_SOLOMON_ERROR.0
-            | status::RX_TIMEOUT.0,
-    )
+    status::ALL_RX_EVENTS
 }
 
 pub(crate) const fn transmit_status_clear_mask() -> SysStatus {
-    SysStatus(
-        status::TX_FRAME_BEGIN.0
-            | status::TX_PREAMBLE_SENT.0
-            | status::TX_HEADER_SENT.0
-            | status::TX_FRAME_SENT.0,
-    )
+    status::ALL_TX
 }
 
 pub(crate) fn set_lde_load_preamble(pmsc_ctrl0: &mut [u8], otp_ctrl: &mut [u8]) {
@@ -292,6 +322,17 @@ pub(crate) fn apply_clock_mode(pmsc_ctrl0: &mut [u8], mode: ClockMode) {
             pmsc_ctrl0[0] &= 0xFC;
             pmsc_ctrl0[0] |= 0x01;
         }
+    }
+}
+
+/// Register value for FS_XTALT from the raw OTP trim: the top three bits must
+/// be 0b011 and an unprogrammed OTP falls back to the mid-range trim (0x10).
+pub(crate) const fn fs_xtalt_value(otp_trim: u8) -> u8 {
+    let trim = otp_trim & 0x1F;
+    if trim == 0 {
+        0x70
+    } else {
+        0x60 | trim
     }
 }
 
@@ -343,6 +384,33 @@ pub(crate) fn extract_preamble_acc_count(rx_finfo: [u8; LEN_RX_FINFO]) -> u16 {
     (((rx_finfo[2] as u16) >> 4) & 0xFF) | ((rx_finfo[3] as u16) << 4)
 }
 
+/// Decodes the receive timestamp and signal metrics from bulk register reads
+/// of `RX_TIME` (14 bytes), `RX_FQUAL` (8 bytes), and `RX_FINFO`.
+pub(crate) fn parse_rx_snapshot(
+    phy: ValidatedPhyConfig,
+    rx_finfo: &[u8; LEN_RX_FINFO],
+    rx_time: &[u8; LEN_RX_TIME],
+    rx_fqual: &[u8; LEN_RX_FQUAL],
+) -> (DwTime, SignalMetrics) {
+    let mut stamp = [0u8; 5];
+    stamp.copy_from_slice(&rx_time[0..5]);
+    let timestamp = DwTime::from_bytes(&stamp);
+    // RX_TIME layout: stamp (0..5), first-path index (5..7), FP_AMPL1 (7..9).
+    let fp1 = u16::from_le_bytes([rx_time[7], rx_time[8]]);
+    // RX_FQUAL layout: STD_NOISE, FP_AMPL2, FP_AMPL3, CIR_PWR (2 bytes each).
+    let noise = u16::from_le_bytes([rx_fqual[0], rx_fqual[1]]);
+    let fp2 = u16::from_le_bytes([rx_fqual[2], rx_fqual[3]]);
+    let fp3 = u16::from_le_bytes([rx_fqual[4], rx_fqual[5]]);
+    let cir_power = u16::from_le_bytes([rx_fqual[6], rx_fqual[7]]);
+    let preamble_acc_count = extract_preamble_acc_count(*rx_finfo);
+    let metrics = SignalMetrics {
+        receive_power_dbm: compute_receive_power(phy, cir_power, preamble_acc_count),
+        first_path_power_dbm: compute_first_path_power(phy, fp1, fp2, fp3, preamble_acc_count),
+        quality: compute_receive_quality(noise, fp2),
+    };
+    (timestamp, metrics)
+}
+
 pub(crate) fn compose_base_register_fields(
     sys_cfg: &mut [u8],
     sys_mask: &mut [u8],
@@ -362,7 +430,10 @@ pub(crate) fn compose_base_register_fields(
     set_bit(sys_mask, MRXFCE_BIT, true);
     set_bit(sys_mask, MRXFSL_BIT, true);
     set_bit(sys_mask, MLDEERR_BIT, true);
-    set_bit(sys_mask, SYS_MASK_BIT3, true);
+    set_bit(sys_mask, MRXRFTO_BIT, true);
+    set_bit(sys_mask, MRXPTO_BIT, true);
+    set_bit(sys_mask, MRXSFDTO_BIT, true);
+    set_bit(sys_mask, MAFFREJ_BIT, true);
 }
 
 pub(crate) fn compose_phy_register_fields(
@@ -379,6 +450,28 @@ pub(crate) fn compose_phy_register_fields(
     sfd_len
 }
 
+/// SFD length in symbols for the SFD scheme selected per data rate.
+const fn sfd_length(rate: DataRate) -> u8 {
+    match rate {
+        DataRate::Mbps6800 => 0x08,
+        DataRate::Kbps850 => 0x10,
+        DataRate::Kbps110 => 0x40,
+    }
+}
+
+const fn preamble_symbols(length: PreambleLength) -> u16 {
+    match length {
+        PreambleLength::Symbols64 => 64,
+        PreambleLength::Symbols128 => 128,
+        PreambleLength::Symbols256 => 256,
+        PreambleLength::Symbols512 => 512,
+        PreambleLength::Symbols1024 => 1024,
+        PreambleLength::Symbols1536 => 1536,
+        PreambleLength::Symbols2048 => 2048,
+        PreambleLength::Symbols4096 => 4096,
+    }
+}
+
 fn compose_data_rate_fields(
     sys_cfg: &mut [u8],
     tx_fctrl: &mut [u8],
@@ -388,15 +481,15 @@ fn compose_data_rate_fields(
     tx_fctrl[1] &= 0x83;
     tx_fctrl[1] |= (rate as u8) << 5;
     set_bit(sys_cfg, RXM110K_BIT, rate == DataRate::Kbps110);
-    let (dwsfd, tnssfd, rnssfd, sfd_len) = match rate {
-        DataRate::Mbps6800 => (false, false, false, 0x08),
-        DataRate::Kbps850 => (true, true, true, 0x10),
-        DataRate::Kbps110 => (true, false, false, 0x40),
+    let (dwsfd, tnssfd, rnssfd) = match rate {
+        DataRate::Mbps6800 => (false, false, false),
+        DataRate::Kbps850 => (true, true, true),
+        DataRate::Kbps110 => (true, false, false),
     };
     set_bit(chan_ctrl, DWSFD_BIT, dwsfd);
     set_bit(chan_ctrl, TNSSFD_BIT, tnssfd);
     set_bit(chan_ctrl, RNSSFD_BIT, rnssfd);
-    sfd_len
+    sfd_length(rate)
 }
 
 fn compose_pulse_frequency_fields(
@@ -433,6 +526,7 @@ pub(crate) struct TuningValues {
     pub(crate) drx_tune1b: u16,
     pub(crate) drx_tune2: u32,
     pub(crate) drx_tune4h: u16,
+    pub(crate) sfd_timeout: u16,
     pub(crate) rf_rxctrlh: u8,
     pub(crate) rf_txctrl: u32,
     pub(crate) tc_pgdelay: u8,
@@ -462,7 +556,10 @@ pub(crate) fn select_tuning_values(phy: ValidatedPhyConfig) -> Result<TuningValu
 
     let drx_tune1b: u16 = match (phy.preamble_length, phy.data_rate) {
         (
-            PreambleLength::Symbols1536 | PreambleLength::Symbols2048 | PreambleLength::Symbols4096,
+            PreambleLength::Symbols1024
+            | PreambleLength::Symbols1536
+            | PreambleLength::Symbols2048
+            | PreambleLength::Symbols4096,
             DataRate::Kbps110,
         ) => 0x0064,
         (PreambleLength::Symbols64, DataRate::Mbps6800) => 0x0010,
@@ -470,6 +567,8 @@ pub(crate) fn select_tuning_values(phy: ValidatedPhyConfig) -> Result<TuningValu
         _ => return Err(ConfigError::UnsupportedPreambleLength),
     };
 
+    // Note: the official driver ships 0x311A003C for PRF16/PAC8; the user
+    // manual (and this table) recommends 0x311A002D. Both are functional.
     let drx_tune2: u32 = match (phy.pac_size, phy.pulse_frequency) {
         (PacSize::Symbols8, PulseFrequency::Mhz16) => 0x311A_002D,
         (PacSize::Symbols8, PulseFrequency::Mhz64) => 0x313B_006B,
@@ -485,6 +584,11 @@ pub(crate) fn select_tuning_values(phy: ValidatedPhyConfig) -> Result<TuningValu
         PreambleLength::Symbols64 => 0x0010u16,
         _ => 0x0028u16,
     };
+
+    // SFD detection timeout in preamble symbols: the receiver gives up when
+    // no SFD follows a detected preamble. Must never be written as zero.
+    let sfd_timeout = preamble_symbols(phy.preamble_length) + 1 + sfd_length(phy.data_rate) as u16
+        - phy.pac_size as u16;
 
     let rf_rxctrlh = match phy.channel {
         crate::config::Channel::Channel4 | crate::config::Channel::Channel7 => 0xBC,
@@ -535,6 +639,7 @@ pub(crate) fn select_tuning_values(phy: ValidatedPhyConfig) -> Result<TuningValu
         drx_tune1b,
         drx_tune2,
         drx_tune4h,
+        sfd_timeout,
         rf_rxctrlh,
         rf_txctrl,
         tc_pgdelay,
@@ -544,6 +649,141 @@ pub(crate) fn select_tuning_values(phy: ValidatedPhyConfig) -> Result<TuningValu
         lde_repc,
         tx_power,
     })
+}
+
+/// Maximum payload of a single [`RegWrite`].
+const REG_WRITE_MAX: usize = 8;
+/// Number of writes produced by [`config_register_writes`].
+pub(crate) const CONFIG_WRITE_COUNT: usize = 28;
+
+/// A single register write, used to share configuration sequences between the
+/// blocking and async frontends.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RegWrite {
+    pub(crate) register: Register,
+    pub(crate) subaddress: u16,
+    len: usize,
+    bytes: [u8; REG_WRITE_MAX],
+}
+
+impl RegWrite {
+    fn new(register: Register, subaddress: u16, data: &[u8]) -> Self {
+        let mut bytes = [0u8; REG_WRITE_MAX];
+        bytes[..data.len()].copy_from_slice(data);
+        Self {
+            register,
+            subaddress,
+            len: data.len(),
+            bytes,
+        }
+    }
+
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+/// Produces the full register-write sequence applied by `reconfigure`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn config_register_writes(
+    identity: &DeviceIdentity,
+    sys_cfg: &[u8; LEN_SYS_CFG],
+    sys_mask: &[u8; LEN_SYS_MASK],
+    chan_ctrl: &[u8; LEN_CHAN_CTRL],
+    tx_fctrl: &[u8; LEN_TX_FCTRL],
+    sfd_len: u8,
+    tuning: &TuningValues,
+    antenna_delay: AntennaDelay,
+    fs_xtalt: u8,
+) -> [RegWrite; CONFIG_WRITE_COUNT] {
+    let mut panadr = [0u8; LEN_PANADR];
+    panadr[0..2].copy_from_slice(&identity.short_address.to_le_bytes());
+    panadr[2..4].copy_from_slice(&identity.pan_id.to_le_bytes());
+    let antenna = antenna_delay.raw().to_le_bytes();
+    debug_assert_eq!(antenna.len(), LEN_TX_ANTD);
+
+    [
+        RegWrite::new(Register::UsrSfd, SFD_LENGTH_SUB, &[sfd_len]),
+        RegWrite::new(Register::PanAdr, NO_SUBADDRESS, &panadr),
+        RegWrite::new(Register::Eui, NO_SUBADDRESS, &identity.eui.to_register_bytes()),
+        RegWrite::new(Register::SysCfg, NO_SUBADDRESS, sys_cfg),
+        RegWrite::new(Register::SysMask, NO_SUBADDRESS, sys_mask),
+        RegWrite::new(Register::ChanCtrl, NO_SUBADDRESS, chan_ctrl),
+        RegWrite::new(Register::TxFctrl, NO_SUBADDRESS, tx_fctrl),
+        RegWrite::new(
+            Register::AgcTune,
+            AGC_TUNE1_SUB,
+            &tuning.agc_tune1.to_le_bytes(),
+        ),
+        RegWrite::new(
+            Register::AgcTune,
+            AGC_TUNE2_SUB,
+            &0x2502_A907u32.to_le_bytes(),
+        ),
+        RegWrite::new(Register::AgcTune, AGC_TUNE3_SUB, &0x0035u16.to_le_bytes()),
+        RegWrite::new(
+            Register::DrxTune,
+            DRX_TUNE0B_SUB,
+            &tuning.drx_tune0b.to_le_bytes(),
+        ),
+        RegWrite::new(
+            Register::DrxTune,
+            DRX_TUNE1A_SUB,
+            &tuning.drx_tune1a.to_le_bytes(),
+        ),
+        RegWrite::new(
+            Register::DrxTune,
+            DRX_TUNE1B_SUB,
+            &tuning.drx_tune1b.to_le_bytes(),
+        ),
+        RegWrite::new(
+            Register::DrxTune,
+            DRX_TUNE2_SUB,
+            &tuning.drx_tune2.to_le_bytes(),
+        ),
+        RegWrite::new(
+            Register::DrxTune,
+            DRX_TUNE4H_SUB,
+            &tuning.drx_tune4h.to_le_bytes(),
+        ),
+        RegWrite::new(
+            Register::DrxTune,
+            DRX_SFDTOC_SUB,
+            &tuning.sfd_timeout.to_le_bytes(),
+        ),
+        RegWrite::new(Register::RfConf, RF_RXCTRLH_SUB, &[tuning.rf_rxctrlh]),
+        RegWrite::new(
+            Register::RfConf,
+            RF_TXCTRL_SUB,
+            &tuning.rf_txctrl.to_le_bytes(),
+        ),
+        RegWrite::new(Register::TxCal, TC_PGDELAY_SUB, &[tuning.tc_pgdelay]),
+        RegWrite::new(
+            Register::FsCtrl,
+            FS_PLLCFG_SUB,
+            &tuning.fspllcfg.to_le_bytes(),
+        ),
+        RegWrite::new(Register::FsCtrl, FS_PLLTUNE_SUB, &[tuning.fsplltune]),
+        RegWrite::new(Register::LdeIf, LDE_CFG1_SUB, &[LDE_CFG1_VALUE]),
+        RegWrite::new(
+            Register::LdeIf,
+            LDE_CFG2_SUB,
+            &tuning.lde_cfg2.to_le_bytes(),
+        ),
+        RegWrite::new(
+            Register::LdeIf,
+            LDE_REPC_SUB,
+            &tuning.lde_repc.to_le_bytes(),
+        ),
+        RegWrite::new(
+            Register::TxPower,
+            NO_SUBADDRESS,
+            &tuning.tx_power.to_le_bytes(),
+        ),
+        RegWrite::new(Register::TxAntd, NO_SUBADDRESS, &antenna),
+        RegWrite::new(Register::LdeIf, LDE_RXANTD_SUB, &antenna),
+        RegWrite::new(Register::FsCtrl, FS_XTALT_SUB, &[fs_xtalt]),
+    ]
 }
 
 pub(crate) fn build_header(register: Register, subaddress: u16, write: bool) -> [u8; 3] {
@@ -574,36 +814,20 @@ pub(crate) const fn header_len(subaddress: u16) -> usize {
 
 pub(crate) fn compose_gpio_led_mode(gpio_mode: &mut [u8]) {
     // Keep RXOKLED/SFDLED disabled and only route RXLED/TXLED to GPIO2/GPIO3.
-    set_gpio_message_mode(
-        gpio_mode,
-        crate::constants::MSGP0 as u16,
-        crate::constants::GPIO_MODE,
-    );
-    set_gpio_message_mode(
-        gpio_mode,
-        crate::constants::MSGP1 as u16,
-        crate::constants::GPIO_MODE,
-    );
-    set_gpio_message_mode(
-        gpio_mode,
-        crate::constants::MSGP2 as u16,
-        crate::constants::LED_MODE,
-    );
-    set_gpio_message_mode(
-        gpio_mode,
-        crate::constants::MSGP3 as u16,
-        crate::constants::LED_MODE,
-    );
+    set_gpio_message_mode(gpio_mode, MSGP0_BIT, GPIO_MODE_GPIO);
+    set_gpio_message_mode(gpio_mode, MSGP1_BIT, GPIO_MODE_GPIO);
+    set_gpio_message_mode(gpio_mode, MSGP2_BIT, GPIO_MODE_LED);
+    set_gpio_message_mode(gpio_mode, MSGP3_BIT, GPIO_MODE_LED);
 }
 
 pub(crate) fn compose_led_clock_enable(pmsc_ctrl0: &mut [u8]) {
-    set_bit(pmsc_ctrl0, crate::constants::GPDCE_BIT as u16, true);
-    set_bit(pmsc_ctrl0, crate::constants::KHZCLKEN_BIT as u16, true);
+    set_bit(pmsc_ctrl0, GPDCE_BIT, true);
+    set_bit(pmsc_ctrl0, KHZCLKEN_BIT, true);
 }
 
 pub(crate) fn compose_led_blink_enable(pmsc_ledc: &mut [u8], blink_time: u8) {
     pmsc_ledc[0] = blink_time;
-    set_bit(pmsc_ledc, crate::constants::BLNKEN as u16, true);
+    set_bit(pmsc_ledc, BLNKEN_BIT, true);
 }
 
 pub(crate) fn set_bit(bytes: &mut [u8], bit: u16, value: bool) {
@@ -734,6 +958,32 @@ mod tests {
     }
 
     #[test]
+    fn schedule_delayed_masks_low_bits_and_predicts_tx_stamp() {
+        let mut runtime = DriverRuntime::new();
+        let mut config = RadioConfig::from_mode(identity(), OperatingMode::LongDataRangeAccuracy);
+        config.antenna_delay = AntennaDelay::new(16_456);
+        runtime.reconfigure(&config).unwrap();
+
+        let now = DwTime::from_ticks(0x12_3456_789A);
+        let delay = DwTime::from_ticks(0x1_0000);
+        let scheduled = runtime.schedule_delayed(now, delay);
+
+        // The DX_TIME value must have the low 9 bits zeroed and must not
+        // include the antenna delay.
+        assert_eq!(scheduled.dx_time().ticks() & 0x1FF, 0);
+        assert_eq!(
+            scheduled.dx_time().ticks(),
+            (now + delay).ticks() & !0x1FF_i64
+        );
+        // The prediction is the DX time plus the antenna delay, exactly what
+        // the chip will report as TX_STAMP.
+        assert_eq!(
+            scheduled.predicted_tx_timestamp().ticks(),
+            scheduled.dx_time().ticks() + 16_456
+        );
+    }
+
+    #[test]
     fn non_finite_receive_power_skips_timestamp_bias_correction() {
         let mut runtime = DriverRuntime::new();
         let mut config = RadioConfig::from_mode(identity(), OperatingMode::LongDataRangeAccuracy);
@@ -753,6 +1003,15 @@ mod tests {
             runtime.correct_receive_timestamp(timestamp, f32::NAN),
             timestamp
         );
+    }
+
+    #[test]
+    fn sfd_timeout_matches_official_formula() {
+        let config = RadioConfig::from_mode(identity(), OperatingMode::LongDataRangeAccuracy);
+        let phy = config.validated_phy().unwrap();
+        let tuning = super::select_tuning_values(phy).unwrap();
+        // 2048-symbol preamble, 64-symbol DW SFD, PAC 64: 2048 + 1 + 64 - 64.
+        assert_eq!(tuning.sfd_timeout, 2049);
     }
 
     #[test]

@@ -169,6 +169,11 @@ impl SysStatus {
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
     }
+
+    /// Returns `true` when at least one bit in `other` is set in `self`.
+    pub const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
 }
 
 impl BitOr for SysStatus {
