@@ -118,15 +118,6 @@ impl<const N: usize> RangingApp<N> {
             );
         }
 
-        if role == Role::Anchor {
-            info!(
-                "anchor listening short={=u16} coordinator={=bool} slot={=u8}",
-                identity.short_address.raw(),
-                anchor_is_coordinator,
-                schedule.anchor_slot
-            );
-        }
-
         Ok(Self {
             board,
             role,

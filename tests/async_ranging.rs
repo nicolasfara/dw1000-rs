@@ -5,15 +5,15 @@ extern crate alloc;
 use alloc::collections::VecDeque;
 
 use dw1000_rs::protocol::{
-    decode_range_timings, detect_frame_kind, encode_discovery_blink, encode_poll_ack,
-    encode_range_report, encode_ranging_init, parse_frame, Frame, FrameKind, RangeReportPayload,
-    RangeTiming,
+    decode_poll_targets, decode_range_timings, detect_frame_kind, encode_discovery_blink,
+    encode_poll_ack, encode_range_report, encode_ranging_init, encode_schedule_sync, parse_frame,
+    Frame, FrameKind, PollTarget, RangeReportPayload, RangeTiming,
 };
 use dw1000_rs::ranging::AsyncRangingRadio;
 use dw1000_rs::{
-    DelayedTime, DeviceIdentity, DwTime, Error, Eui64, PanId, ProtocolError, RangingConfig,
-    RangingEvent, RangingNode, Role, RxFrame, RxOptions, ShortAddress, SignalMetrics, SysStatus,
-    Timestamps, TxOptions,
+    DelayedTime, DeviceIdentity, DwTime, Error, Eui64, PanId, RangingConfig, RangingEvent,
+    RangingNode, Role, RxFrame, RxOptions, ShortAddress, SignalMetrics, SysStatus, Timestamps,
+    TxOptions,
 };
 use futures::executor::block_on;
 
@@ -941,6 +941,25 @@ fn two_tags_use_distinct_tdma_slots() {
 
         slot0.start_async(&mut slot0_radio, 0).await.unwrap();
         slot1.start_async(&mut slot1_radio, 0).await.unwrap();
+
+        let coordinator = identity(0x1111, [9, 9, 9, 9, 9, 9, 9, 9]);
+        let mut sync = [0u8; 127];
+        let sync_len = encode_schedule_sync(
+            0,
+            coordinator.short_address,
+            ShortAddress::BROADCAST,
+            0,
+            2,
+            100,
+            &mut sync,
+        )
+        .unwrap();
+
+        slot0_radio.push_rx(&sync[..sync_len], DwTime::from_ticks(10), metrics());
+        slot0.on_rx_async(&mut slot0_radio, 0, &mut [0u8; 127]).await.unwrap();
+
+        slot1_radio.push_rx(&sync[..sync_len], DwTime::from_ticks(10), metrics());
+        slot1.on_rx_async(&mut slot1_radio, 0, &mut [0u8; 127]).await.unwrap();
 
         slot0.tick_async(&mut slot0_radio, 80).await.unwrap();
         slot1.tick_async(&mut slot1_radio, 80).await.unwrap();

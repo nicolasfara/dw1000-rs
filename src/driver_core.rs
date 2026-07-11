@@ -50,6 +50,14 @@ pub(crate) const OTP_ADDRESS_XTAL_TRIM: u16 = 0x01E;
 /// OTP_SF value that kicks the LDO tune load from OTP.
 pub(crate) const OTP_SF_LDO_KICK: u8 = 0x02;
 
+const RECEIVE_RESTART_EVENTS: u64 = status::RX_FRAME_READY.0
+    | status::RX_FRAME_GOOD.0
+    | status::RX_FRAME_CHECK_ERROR.0
+    | status::RX_REED_SOLOMON_ERROR.0
+    | status::RX_TIMEOUT.0
+    | status::RX_HEADER_ERROR.0
+    | status::LDE_ERROR.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClockMode {
     Auto,

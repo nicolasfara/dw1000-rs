@@ -217,7 +217,7 @@ pub struct Peer {
     /// Most recent inbound sequence number accepted from this peer.
     pub last_sequence: Option<u8>,
     /// Reply delay selected for this peer.
-    pub reply_delay_us: u16,
+    pub reply_delay_us: u32,
     /// Anchor-side flag: a poll from this peer was acknowledged and the
     /// matching range frame has not arrived yet.
     pub awaiting_range: bool,

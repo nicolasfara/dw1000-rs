@@ -243,21 +243,21 @@ enum Reply {
     RangingInit {
         eui: Eui64,
         short: ShortAddress,
-        reply_delay_us: u16,
+        reply_delay_us: u32,
     },
     /// Send a delayed poll-ack frame.
     PollAck {
         destination: ShortAddress,
-        reply_delay_us: u16,
+        reply_delay_us: u32,
     },
     /// Send a delayed broadcast range frame embedding the predicted transmit
     /// timestamp.
-    Range { reply_delay_us: u16 },
+    Range { reply_delay_us: u32 },
     /// Send a delayed range report.
     RangeReport {
         destination: ShortAddress,
         payload: RangeReportPayload,
-        reply_delay_us: u16,
+        reply_delay_us: u32,
     },
 }
 
@@ -400,7 +400,7 @@ impl<const N: usize> RangingNode<N> {
                     Reply::RangingInit {
                         eui: blink.source_eui,
                         short: blink.source_short,
-                        reply_delay_us: self.config.discovery_reply_delay_us,
+                        reply_delay_us: u32::from(self.config.discovery_reply_delay_us),
                     },
                     Some(RangingEvent::BlinkReceived(snapshot)),
                 ))
@@ -493,7 +493,7 @@ impl<const N: usize> RangingNode<N> {
                     self.begin_range_report_phase(now_ms);
                     return Ok((
                         Reply::Range {
-                            reply_delay_us: self.config.reply_delay_us,
+                            reply_delay_us: u32::from(self.config.reply_delay_us),
                         },
                         None,
                     ));
@@ -593,7 +593,7 @@ impl<const N: usize> RangingNode<N> {
                     return Ok((Reply::None, None));
                 }
                 let range_filter = self.config.range_filter;
-                let (short_address, snapshot) = {
+                let snapshot = {
                     let Some(peer) = self.peer_mut(peer_short) else {
                         return Ok((Reply::None, None));
                     };
@@ -610,7 +610,7 @@ impl<const N: usize> RangingNode<N> {
                     peer.metrics.first_path_power_dbm = frame.metrics.first_path_power_dbm;
                     peer.metrics.quality = frame.metrics.quality;
                     peer.last_activity_ms = now_ms;
-                    (peer.short_address, PeerSnapshot::from(&*peer))
+                    PeerSnapshot::from(&*peer)
                 };
                 if !self.range_reports_received.contains(&peer_short) {
                     self.range_reports_received
@@ -786,7 +786,7 @@ impl<const N: usize> RangingNode<N> {
         }; N];
         let base_reply_delay_us = self.config.reply_delay_us;
         for (index, peer) in self.peers.iter_mut().enumerate() {
-            peer.reply_delay_us = scheduled_reply_delay_us(base_reply_delay_us, index)?;
+            peer.reply_delay_us = scheduled_reply_delay_us(u32::from(base_reply_delay_us), index)?;
             targets[index] = PollTarget {
                 short_address: peer.short_address,
                 reply_delay_us: peer.reply_delay_us,
@@ -942,33 +942,6 @@ impl<const N: usize> RangingNode<N> {
             return Ok(None);
         }
         Ok(Some(peer.short_address))
-    }
-
-    fn observe_schedule_sync(&self, sync: ScheduleSyncFrame) -> Option<ShortAddress> {
-        self.matches_short_destination(sync.header.destination, true)
-            .then_some(sync.header.source)
-    }
-
-    fn accept_schedule_sync(
-        &mut self,
-        sync: ScheduleSyncFrame,
-        now_ms: u32,
-    ) -> Result<Option<ShortAddress>, ProtocolError> {
-        let Some(source) = self.observe_schedule_sync(sync) else {
-            return Ok(None);
-        };
-        let peer = self.ensure_peer(None, source, now_ms)?;
-        if !observe_peer_sequence(peer, sync.header.sequence) {
-            return Ok(None);
-        }
-        let short_address = peer.short_address;
-        let frame_ms = u32::from(sync.tag_slot_count).saturating_mul(sync.tag_slot_ms);
-        self.schedule_epoch_ms = Some(if frame_ms == 0 {
-            now_ms
-        } else {
-            now_ms.wrapping_sub(sync.epoch_ms % frame_ms)
-        });
-        Ok(Some(short_address))
     }
 
     fn accept_header(
@@ -1179,7 +1152,7 @@ impl<const N: usize> RangingNode<N> {
             TickAction::Range => self.execute_reply(
                 radio,
                 Reply::Range {
-                    reply_delay_us: self.config.reply_delay_us,
+                    reply_delay_us: u32::from(self.config.reply_delay_us),
                 },
             )?,
             TickAction::ScheduleSync => {
@@ -1345,7 +1318,7 @@ impl<const N: usize> RangingNode<N> {
                 self.execute_reply_async(
                     radio,
                     Reply::Range {
-                        reply_delay_us: self.config.reply_delay_us,
+                        reply_delay_us: u32::from(self.config.reply_delay_us),
                     },
                 )
                 .await?;

@@ -17,7 +17,7 @@ const COMMON_HEADER_LEN: usize = 6;
 const BLINK_LEN: usize = 12;
 const RANGING_INIT_LEN: usize = 12;
 const SCHEDULE_SYNC_PAYLOAD_LEN: usize = 9;
-const POLL_TARGET_LEN: usize = 4;
+const POLL_TARGET_LEN: usize = 6;
 const RANGE_TIMING_LEN: usize = 17;
 const RANGE_REPORT_LEN: usize = 19;
 
