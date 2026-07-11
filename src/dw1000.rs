@@ -14,7 +14,7 @@ use crate::driver_core::{
     receive_status_clear_mask, select_tuning_values, set_lde_load_preamble,
     set_lde_restore_preamble, transmit_status_clear_mask, ClockMode, DriverRuntime,
     DELAYED_TX_LATE_MASK, HPDWARN_HI_BIT, OTP_ADDRESS_LDOTUNE, OTP_ADDRESS_XTAL_TRIM,
-    OTP_SF_LDO_KICK, PMSC_SOFTRESET_CLEAR, PMSC_SOFTRESET_RX, SYS_STATUS_HI_SUB,
+    OTP_SF_LDO_KICK, PMSC_SOFTRESET_CLEAR, PMSC_SOFTRESET_RX, SYS_STATUS_HI_SUB, TXFRS_LOW_BIT,
 };
 use crate::error::{Error, RxError};
 use crate::registers::{
@@ -204,6 +204,14 @@ where
             self.read_register(Register::SysStatus, SYS_STATUS_HI_SUB, &mut status_hi)?;
             if u16::from_le_bytes(status_hi) & DELAYED_TX_LATE_MASK != 0 {
                 self.idle()?;
+                // Do not leave the node deaf: restore the permanent receive
+                // session the aborted transmission interrupted.
+                if self.runtime.permanent_receive {
+                    self.start_receive(RxOptions {
+                        delayed_time: None,
+                        permanent: true,
+                    })?;
+                }
                 return Err(Error::DelayedSendTooLate);
             }
         }
@@ -298,13 +306,24 @@ where
 
     /// Clears the selected `SYS_STATUS` bits and re-arms permanent receive after RX/TX completion.
     pub fn clear_events(&mut self, event_mask: SysStatus) -> Result<(), Error<SPI::Error, PinE>> {
+        let should_rearm_after_good_receive =
+            self.runtime.should_rearm_after_good_receive(event_mask);
+        // Restarting the receiver issues TRXOFF, which would cancel a delayed
+        // transmission scheduled after `event_mask` was read. Only restart
+        // when the chip still reports a completed transmission; a pending
+        // delayed TX re-arms the receiver from its own TX-done event instead.
+        let mut should_restart_receive = self.runtime.should_restart_receive(event_mask);
+        if should_restart_receive {
+            let mut status_low = [0u8; 1];
+            self.read_register(Register::SysStatus, NO_SUBADDRESS, &mut status_low)?;
+            should_restart_receive = status_low[0] & TXFRS_LOW_BIT != 0;
+        }
         self.write_register(
             Register::SysStatus,
             NO_SUBADDRESS,
             &sys_status_to_bytes(event_mask),
         )?;
-        let should_restart_receive = self.runtime.should_restart_receive(event_mask);
-        if should_restart_receive {
+        if should_restart_receive || should_rearm_after_good_receive {
             self.start_receive(RxOptions {
                 delayed_time: None,
                 permanent: true,

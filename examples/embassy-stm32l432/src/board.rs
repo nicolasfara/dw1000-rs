@@ -67,13 +67,7 @@ impl Board {
         let mut spi_config = SpiConfig::default();
         spi_config.frequency = Hertz(DW1000_SPI_BAUD_HZ);
         let spi = Spi::new(
-            p.SPI1,
-            p.PA5,
-            p.PA7,
-            p.PA6,
-            p.DMA1_CH3,
-            p.DMA1_CH2,
-            spi_config,
+            p.SPI1, p.PA5, p.PA7, p.PA6, p.DMA1_CH3, p.DMA1_CH2, spi_config,
         );
         let cs = Output::new(p.PA4, Level::High, Speed::High);
         let irq = ExtiInput::new(p.PA2, p.EXTI2, Pull::None);
@@ -118,9 +112,14 @@ impl Board {
             self.fault_loop("radio reinit failed").await;
         }
         if self.radio.enable_leds().await.is_err() {
-            self.fault_loop("failed to re-enable DW1000 RX/TX leds").await;
+            self.fault_loop("failed to re-enable DW1000 RX/TX leds")
+                .await;
         }
-        if node.recover_link_async(&mut self.radio, now_ms).await.is_err() {
+        if node
+            .recover_link_async(&mut self.radio, now_ms)
+            .await
+            .is_err()
+        {
             self.fault_loop("link recovery failed").await;
         }
         self.orange_led.set_low();

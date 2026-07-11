@@ -244,7 +244,11 @@ fn read_signal_metrics_before_config_returns_not_configured() {
 #[test]
 fn clear_tx_sent_restarts_receive_when_permanent_mode_is_enabled() {
     let log = Arc::new(Mutex::new(Vec::new()));
-    let spi = RecordingSpi::new(log.clone(), VecDeque::new());
+    // The live SYS_STATUS check must still report the completed transmission.
+    let reads = VecDeque::from(vec![vec![
+        (dw1000_rs::registers::status::TX_FRAME_SENT.0 & 0xFF) as u8,
+    ]]);
+    let spi = RecordingSpi::new(log.clone(), reads);
     let mut driver = Dw1000::new(spi, MockInputPin, MockOutputPin);
 
     driver
@@ -269,7 +273,7 @@ fn clear_tx_sent_restarts_receive_when_permanent_mode_is_enabled() {
 }
 
 #[test]
-fn clear_rx_ready_restarts_receive_when_permanent_mode_is_enabled() {
+fn clear_good_receive_restarts_single_buffered_permanent_receive() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let spi = RecordingSpi::new(log.clone(), VecDeque::new());
     let mut driver = Dw1000::new(spi, MockInputPin, MockOutputPin);
@@ -281,7 +285,10 @@ fn clear_rx_ready_restarts_receive_when_permanent_mode_is_enabled() {
         })
         .unwrap();
     driver
-        .clear_events(dw1000_rs::registers::status::RX_FRAME_READY)
+        .clear_events(
+            dw1000_rs::registers::status::RX_FRAME_READY
+                | dw1000_rs::registers::status::RX_FRAME_GOOD,
+        )
         .unwrap();
 
     let transactions = log.lock().unwrap();
@@ -290,6 +297,36 @@ fn clear_rx_ready_restarts_receive_when_permanent_mode_is_enabled() {
         .filter(|transaction| transaction.writes == vec![vec![0x8D], vec![0x00, 0x01, 0x00, 0x00]])
         .count();
     assert_eq!(restart_count, 2);
+}
+
+#[test]
+fn clear_stale_tx_sent_does_not_cancel_a_pending_delayed_transmission() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    // TXFRS reads back clear: the mask carries a stale bit while a new
+    // delayed transmission is still pending, so the receiver must not be
+    // restarted (TRXOFF would cancel the pending send).
+    let spi = RecordingSpi::new(log.clone(), VecDeque::new());
+    let mut driver = Dw1000::new(spi, MockInputPin, MockOutputPin);
+
+    driver
+        .start_receive(RxOptions {
+            delayed_time: None,
+            permanent: true,
+        })
+        .unwrap();
+    driver
+        .transmit(&[0xAA, 0xBB, 0xCC], TxOptions::default())
+        .unwrap();
+    driver
+        .clear_events(dw1000_rs::registers::status::TX_FRAME_SENT)
+        .unwrap();
+
+    let transactions = log.lock().unwrap();
+    let restart_count = transactions
+        .iter()
+        .filter(|transaction| transaction.writes == vec![vec![0x8D], vec![0x00, 0x01, 0x00, 0x00]])
+        .count();
+    assert_eq!(restart_count, 1);
 }
 
 #[test]
@@ -317,7 +354,10 @@ fn clearing_rx_event_does_not_cancel_pending_delayed_tx() {
         )
         .unwrap();
     driver
-        .clear_events(dw1000_rs::registers::status::RX_TIMEOUT)
+        .clear_events(
+            dw1000_rs::registers::status::RX_FRAME_READY
+                | dw1000_rs::registers::status::RX_FRAME_GOOD,
+        )
         .unwrap();
 
     let transactions = log.lock().unwrap();

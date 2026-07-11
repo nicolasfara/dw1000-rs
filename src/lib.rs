@@ -24,5 +24,5 @@ pub use device::{
 };
 pub use dw1000::Dw1000;
 pub use error::{Error, ProtocolError, RxError};
-pub use ranging::{RangingConfig, RangingEvent, RangingNode, Role};
+pub use ranging::{RangingConfig, RangingEvent, RangingNode, RangingSchedule, Role};
 pub use time::{DW1000Time, DelayedTime, DwTime};

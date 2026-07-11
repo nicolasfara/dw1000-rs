@@ -289,7 +289,11 @@ fn async_read_signal_metrics_before_config_returns_not_configured() {
 #[test]
 fn async_clear_tx_sent_restarts_receive_when_permanent_mode_is_enabled() {
     let log = Arc::new(Mutex::new(Vec::new()));
-    let spi = RecordingAsyncSpi::new(log.clone(), VecDeque::new());
+    // The live SYS_STATUS check must still report the completed transmission.
+    let reads = VecDeque::from(vec![vec![
+        (dw1000_rs::registers::status::TX_FRAME_SENT.0 & 0xFF) as u8,
+    ]]);
+    let spi = RecordingAsyncSpi::new(log.clone(), reads);
     let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
 
     block_on(driver.start_receive(RxOptions {
@@ -309,7 +313,7 @@ fn async_clear_tx_sent_restarts_receive_when_permanent_mode_is_enabled() {
 }
 
 #[test]
-fn async_clear_rx_ready_restarts_receive_when_permanent_mode_is_enabled() {
+fn async_clear_good_receive_restarts_single_buffered_permanent_receive() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let spi = RecordingAsyncSpi::new(log.clone(), VecDeque::new());
     let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
@@ -319,7 +323,11 @@ fn async_clear_rx_ready_restarts_receive_when_permanent_mode_is_enabled() {
         permanent: true,
     }))
     .unwrap();
-    block_on(driver.clear_events(dw1000_rs::registers::status::RX_FRAME_READY)).unwrap();
+    block_on(driver.clear_events(
+        dw1000_rs::registers::status::RX_FRAME_READY
+            | dw1000_rs::registers::status::RX_FRAME_GOOD,
+    ))
+    .unwrap();
 
     let transactions = log.lock().unwrap();
     let restart_count = transactions
@@ -327,4 +335,63 @@ fn async_clear_rx_ready_restarts_receive_when_permanent_mode_is_enabled() {
         .filter(|transaction| transaction.writes == vec![vec![0x8D], vec![0x00, 0x01, 0x00, 0x00]])
         .count();
     assert_eq!(restart_count, 2);
+}
+
+#[test]
+fn async_clearing_good_receive_does_not_cancel_pending_delayed_transmission() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let spi = RecordingAsyncSpi::new(log.clone(), VecDeque::new());
+    let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
+
+    block_on(driver.start_receive(RxOptions {
+        delayed_time: None,
+        permanent: true,
+    }))
+    .unwrap();
+    let scheduled = block_on(driver.schedule_delayed(DwTime::from_micros(7000.0))).unwrap();
+    block_on(driver.transmit(
+        &[0xAA, 0xBB, 0xCC],
+        TxOptions {
+            delayed_time: Some(scheduled),
+            wait_for_response: false,
+        },
+    ))
+    .unwrap();
+    block_on(driver.clear_events(
+        dw1000_rs::registers::status::RX_FRAME_READY
+            | dw1000_rs::registers::status::RX_FRAME_GOOD,
+    ))
+    .unwrap();
+
+    let transactions = log.lock().unwrap();
+    let restart_count = transactions
+        .iter()
+        .filter(|transaction| transaction.writes == vec![vec![0x8D], vec![0x00, 0x01, 0x00, 0x00]])
+        .count();
+    assert_eq!(restart_count, 1);
+}
+
+#[test]
+fn async_clear_stale_tx_sent_does_not_cancel_a_pending_delayed_transmission() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    // TXFRS reads back clear: the mask carries a stale bit while a new
+    // delayed transmission is still pending, so the receiver must not be
+    // restarted (TRXOFF would cancel the pending send).
+    let spi = RecordingAsyncSpi::new(log.clone(), VecDeque::new());
+    let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
+
+    block_on(driver.start_receive(RxOptions {
+        delayed_time: None,
+        permanent: true,
+    }))
+    .unwrap();
+    block_on(driver.transmit(&[0xAA, 0xBB, 0xCC], TxOptions::default())).unwrap();
+    block_on(driver.clear_events(dw1000_rs::registers::status::TX_FRAME_SENT)).unwrap();
+
+    let transactions = log.lock().unwrap();
+    let restart_count = transactions
+        .iter()
+        .filter(|transaction| transaction.writes == vec![vec![0x8D], vec![0x00, 0x01, 0x00, 0x00]])
+        .count();
+    assert_eq!(restart_count, 1);
 }

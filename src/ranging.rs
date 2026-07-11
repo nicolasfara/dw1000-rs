@@ -12,9 +12,9 @@ use crate::device::{DeviceIdentity, Eui64, Peer, PeerSnapshot, RxFrame, ShortAdd
 use crate::error::{Error, ProtocolError};
 use crate::protocol::{
     decode_poll_targets, decode_range_timings, encode_discovery_blink, encode_poll,
-    encode_poll_ack, encode_range, encode_range_report, encode_ranging_init, parse_frame,
-    BlinkFrame, Frame, FrameHeader, FrameKind, PollTarget, RangeReportPayload, RangeTiming,
-    RangingInitFrame,
+    encode_poll_ack, encode_range, encode_range_report, encode_ranging_init, encode_schedule_sync,
+    parse_frame, BlinkFrame, Frame, FrameHeader, FrameKind, PollTarget, RangeReportPayload,
+    RangeTiming, RangingInitFrame, ScheduleSyncFrame,
 };
 use crate::time::{DelayedTime, DwTime};
 
@@ -44,27 +44,25 @@ pub enum RangingEvent {
     RangeUpdated(PeerSnapshot),
     /// A ranging-init message was received.
     RangingInitReceived(ShortAddress),
-    /// A schedule-sync message was received.
+    /// A coordinator schedule-sync message was received.
     ScheduleSyncReceived(ShortAddress),
+    /// A tag exchange did not complete before the configured timeout.
+    ExchangeTimedOut,
 }
 
-/// Deterministic ranging schedule for multi-anchor and multi-tag systems.
+/// Deterministic schedule shared by tags and their anchor coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RangingSchedule {
-    /// Anchor response slot used during discovery.
-    pub anchor_slot: u8,
-    /// Spacing between delayed anchor discovery responses, in microseconds.
-    pub discovery_slot_spacing_us: u32,
-    /// Tag TDMA slot used for initiating ranging.
+    /// TDMA slot used by this tag.
     pub tag_slot: u8,
-    /// Number of tag TDMA slots.
+    /// Number of TDMA slots shared by tags on the same PAN.
     pub tag_slot_count: u8,
-    /// Duration of each tag TDMA slot, in milliseconds.
+    /// Duration of a TDMA slot, in milliseconds.
     pub tag_slot_ms: u32,
-    /// Timeout for poll-ack and range-report collection, in milliseconds.
+    /// Maximum time to collect poll acknowledgements or range reports.
     pub session_timeout_ms: u32,
-    /// Minimum period between tag ranging attempts, in milliseconds.
+    /// Minimum interval between tag ranging attempts and coordinator syncs.
     pub range_period_ms: u32,
 }
 
@@ -72,8 +70,6 @@ impl RangingSchedule {
     /// Default schedule for one tag and up to four anchors.
     pub const fn new() -> Self {
         Self {
-            anchor_slot: 0,
-            discovery_slot_spacing_us: 12_000,
             tag_slot: 0,
             tag_slot_count: 1,
             tag_slot_ms: 250,
@@ -96,16 +92,27 @@ pub struct RangingConfig {
     /// Local identity used for frame addressing.
     pub identity: DeviceIdentity,
     /// Reply delay used by the protocol, in microseconds.
-    pub reply_delay_us: u32,
+    pub reply_delay_us: u16,
+    /// Delayed reply to a discovery blink, in microseconds.
+    ///
+    /// Set this to a distinct non-zero value on each anchor to prevent their
+    /// ranging-init frames from colliding during multi-anchor discovery.
+    pub discovery_reply_delay_us: u16,
     /// Inactivity timeout, in milliseconds.
     pub reset_period_ms: u32,
     /// Periodic timer tick, in milliseconds.
     pub timer_period_ms: u32,
+    /// Maximum duration of one poll/range exchange, in milliseconds.
+    ///
+    /// When it expires the tag resets the exchange and polls again in its
+    /// next slot; anchors accept the new poll directly, so no extra blink
+    /// is transmitted.
+    pub exchange_timeout_ms: u32,
     /// Optional exponential moving average factor.
     pub range_filter: Option<u16>,
-    /// Multi-node deterministic schedule.
+    /// Shared coordinator schedule.
     pub schedule: RangingSchedule,
-    /// Whether this anchor broadcasts schedule-sync frames.
+    /// Whether this anchor broadcasts the coordinator schedule.
     pub anchor_is_coordinator: bool,
 }
 
@@ -115,8 +122,10 @@ impl RangingConfig {
         Self {
             identity,
             reply_delay_us: 7000,
+            discovery_reply_delay_us: 0,
             reset_period_ms: 200,
             timer_period_ms: 80,
+            exchange_timeout_ms: 500,
             range_filter: None,
             schedule: RangingSchedule::new(),
             anchor_is_coordinator: false,
@@ -230,10 +239,11 @@ struct PendingTx {
 enum Reply {
     /// Nothing to send.
     None,
-    /// Send a ranging-init frame immediately.
+    /// Send a ranging-init frame, optionally after a scheduled delay.
     RangingInit {
         eui: Eui64,
         short: ShortAddress,
+        reply_delay_us: u16,
     },
     /// Send a delayed poll-ack frame.
     PollAck {
@@ -242,9 +252,7 @@ enum Reply {
     },
     /// Send a delayed broadcast range frame embedding the predicted transmit
     /// timestamp.
-    Range {
-        reply_delay_us: u16,
-    },
+    Range { reply_delay_us: u16 },
     /// Send a delayed range report.
     RangeReport {
         destination: ShortAddress,
@@ -258,6 +266,8 @@ enum TickAction {
     None,
     Blink,
     Poll,
+    Range,
+    ScheduleSync,
 }
 
 /// Tag/anchor ranging state machine.
@@ -274,9 +284,11 @@ pub struct RangingNode<const N: usize> {
     last_tx_kind: Option<FrameKind>,
     last_tx_destination: ShortAddress,
     poll_acknowledged: Vec<ShortAddress, N>,
-    range_report_received: Vec<ShortAddress, N>,
+    range_reports_received: Vec<ShortAddress, N>,
+    exchange_started_ms: u32,
     session_deadline_ms: Option<u32>,
     last_range_start_ms: u32,
+    last_schedule_sync_ms: u32,
     schedule_epoch_ms: Option<u32>,
 }
 
@@ -289,7 +301,7 @@ impl<const N: usize> RangingNode<N> {
             peers: Vec::new(),
             sequence: 0,
             expected: match role {
-                Role::Tag => FrameKind::PollAck,
+                Role::Tag => FrameKind::Blink,
                 Role::Anchor => FrameKind::Poll,
             },
             last_activity_ms: 0,
@@ -298,9 +310,11 @@ impl<const N: usize> RangingNode<N> {
             last_tx_kind: None,
             last_tx_destination: ShortAddress::BROADCAST,
             poll_acknowledged: Vec::new(),
-            range_report_received: Vec::new(),
+            range_reports_received: Vec::new(),
+            exchange_started_ms: 0,
             session_deadline_ms: None,
             last_range_start_ms: 0,
+            last_schedule_sync_ms: 0,
             schedule_epoch_ms: None,
         }
     }
@@ -327,6 +341,10 @@ impl<const N: usize> RangingNode<N> {
     fn start_session_state(&mut self, now_ms: u32) {
         self.last_activity_ms = now_ms;
         self.last_tick_ms = now_ms;
+        if self.role == Role::Anchor && self.config.anchor_is_coordinator {
+            self.last_schedule_sync_ms =
+                now_ms.wrapping_sub(self.config.schedule.range_period_ms / 2);
+        }
     }
 
     /// Records the actual transmit timestamp for the last sent frame.
@@ -351,8 +369,11 @@ impl<const N: usize> RangingNode<N> {
             }
             (Role::Tag, FrameKind::Range) => {
                 if self.last_tx_destination.is_broadcast() {
-                    for peer in self.peers.iter_mut() {
-                        peer.range_sent = tx;
+                    for index in 0..self.poll_acknowledged.len() {
+                        let short = self.poll_acknowledged[index];
+                        if let Some(peer) = self.peer_mut(short) {
+                            peer.range_sent = tx;
+                        }
                     }
                 } else if let Some(peer) = self.peer_mut(self.last_tx_destination) {
                     peer.range_sent = tx;
@@ -375,23 +396,26 @@ impl<const N: usize> RangingNode<N> {
                 let Some(snapshot) = self.accept_blink(blink, now_ms)? else {
                     return Ok((Reply::None, None));
                 };
-                self.reset_protocol_state();
                 Ok((
                     Reply::RangingInit {
                         eui: blink.source_eui,
                         short: blink.source_short,
+                        reply_delay_us: self.config.discovery_reply_delay_us,
                     },
                     Some(RangingEvent::BlinkReceived(snapshot)),
                 ))
             }
             Frame::ScheduleSync(sync) => {
                 let Some(short_address) = self.observe_schedule_sync(sync) else {
-                    return Ok(None);
+                    return Ok((Reply::None, None));
                 };
                 if self.role == Role::Tag {
-                    self.accept_schedule_sync(sync, now_ms)?;
+                    self.accept_schedule_sync(sync, now_ms);
                 }
-                Ok(Some(RangingEvent::ScheduleSyncReceived(short_address)))
+                Ok((
+                    Reply::None,
+                    Some(RangingEvent::ScheduleSyncReceived(short_address)),
+                ))
             }
             Frame::RangingInit(init) if self.role == Role::Tag => {
                 let Some(short_address) = self.accept_ranging_init(init, now_ms)? else {
@@ -404,11 +428,7 @@ impl<const N: usize> RangingNode<N> {
                 ))
             }
             Frame::Poll { header, payload } if self.role == Role::Anchor => {
-                let Some(peer_short) = self.accept_header(header, true, now_ms)? else {
-                    return Ok((Reply::None, None));
-                };
-                if self.expected != FrameKind::Poll {
-                    self.reset_protocol_state();
+                if !self.matches_short_destination(header.destination, true) {
                     return Ok((Reply::None, None));
                 }
                 let mut targets = [PollTarget {
@@ -424,14 +444,21 @@ impl<const N: usize> RangingNode<N> {
                 else {
                     return Ok((Reply::None, None));
                 };
-                let Some(peer) = self.peer_mut(peer_short) else {
+                // A poll addressed to this anchor opens a fresh exchange for
+                // that tag only. The exchange state lives on the peer, so
+                // several tags can interleave exchanges without resetting
+                // each other, and an anchor that restarted rejoins from the
+                // poll itself instead of waiting for a discovery blink.
+                let peer = self.ensure_peer(None, header.source, now_ms)?;
+                if !observe_peer_sequence(peer, header.sequence) {
                     return Ok((Reply::None, None));
-                };
+                }
                 peer.poll_received = frame.timestamp;
+                peer.poll_received_ms = now_ms;
+                peer.awaiting_range = true;
                 peer.last_activity_ms = now_ms;
                 peer.reply_delay_us = target.reply_delay_us;
                 let destination = peer.short_address;
-                self.expected = FrameKind::Range;
                 Ok((
                     Reply::PollAck {
                         destination,
@@ -444,8 +471,9 @@ impl<const N: usize> RangingNode<N> {
                 let Some(peer_short) = self.accept_header(header, false, now_ms)? else {
                     return Ok((Reply::None, None));
                 };
+                // A stray acknowledgement must not destroy an exchange that
+                // has already moved on; the exchange timeout handles stalls.
                 if self.expected != FrameKind::PollAck {
-                    self.reset_protocol_state();
                     return Ok((Reply::None, None));
                 }
                 let short_address = {
@@ -462,7 +490,7 @@ impl<const N: usize> RangingNode<N> {
                         .map_err(|_| ProtocolError::PeerTableFull)?;
                 }
                 if self.poll_acknowledged.len() == self.peers.len() {
-                    self.expected = FrameKind::RangeReport;
+                    self.begin_range_report_phase(now_ms);
                     return Ok((
                         Reply::Range {
                             reply_delay_us: self.config.reply_delay_us,
@@ -476,8 +504,20 @@ impl<const N: usize> RangingNode<N> {
                 let Some(peer_short) = self.accept_header(header, true, now_ms)? else {
                     return Ok((Reply::None, None));
                 };
-                if self.expected != FrameKind::Range {
-                    self.reset_protocol_state();
+                // Only answer a range that matches a poll this anchor
+                // acknowledged recently; anything else is stale and would
+                // mix timestamps from two different exchanges.
+                let freshness_bound_ms = self.config.schedule.session_timeout_ms.saturating_mul(2);
+                let fresh = self
+                    .peer_mut(peer_short)
+                    .map(|peer| {
+                        let fresh = peer.awaiting_range
+                            && now_ms.wrapping_sub(peer.poll_received_ms) <= freshness_bound_ms;
+                        peer.awaiting_range = false;
+                        fresh
+                    })
+                    .unwrap_or(false);
+                if !fresh {
                     return Ok((Reply::None, None));
                 }
                 let mut timings = [RangeTiming {
@@ -493,9 +533,11 @@ impl<const N: usize> RangingNode<N> {
                     .find(|timing| timing.short_address == local)
                     .copied()
                 else {
+                    // The tag never received this anchor's poll-ack: the
+                    // exchange is over for this anchor (the pending flag was
+                    // cleared above), so just wait for the next poll.
                     return Ok((Reply::None, None));
                 };
-                self.expected = FrameKind::Poll;
                 let range_filter = self.config.range_filter;
                 let (destination, reply_delay_us, report, snapshot) = {
                     let Some(peer) = self.peer_mut(peer_short) else {
@@ -542,8 +584,12 @@ impl<const N: usize> RangingNode<N> {
                 let Some(peer_short) = self.accept_header(header, false, now_ms)? else {
                     return Ok((Reply::None, None));
                 };
+                // Same as poll-acks: a late report must not reset the state
+                // machine while a new exchange is being set up.
                 if self.expected != FrameKind::RangeReport {
-                    self.reset_protocol_state();
+                    return Ok((Reply::None, None));
+                }
+                if !self.poll_acknowledged.contains(&peer_short) {
                     return Ok((Reply::None, None));
                 }
                 let range_filter = self.config.range_filter;
@@ -566,6 +612,14 @@ impl<const N: usize> RangingNode<N> {
                     peer.last_activity_ms = now_ms;
                     (peer.short_address, PeerSnapshot::from(&*peer))
                 };
+                if !self.range_reports_received.contains(&peer_short) {
+                    self.range_reports_received
+                        .push(peer_short)
+                        .map_err(|_| ProtocolError::PeerTableFull)?;
+                }
+                if self.range_reports_received.len() == self.poll_acknowledged.len() {
+                    self.reset_protocol_state();
+                }
                 Ok((Reply::None, Some(RangingEvent::RangeUpdated(snapshot))))
             }
             Frame::RangeFailed { header } if self.role == Role::Tag => {
@@ -592,27 +646,84 @@ impl<const N: usize> RangingNode<N> {
             return (Some(RangingEvent::PeerInactive(short)), TickAction::None);
         }
 
+        if self.role == Role::Tag && self.session_expired(now_ms) {
+            return match self.expected {
+                FrameKind::PollAck if !self.poll_acknowledged.is_empty() => {
+                    self.begin_range_report_phase(now_ms);
+                    (None, TickAction::Range)
+                }
+                FrameKind::PollAck | FrameKind::RangeReport => {
+                    // Reset without transmitting: the next poll (or the
+                    // periodic discovery blink) goes out in this tag's own
+                    // slot instead of trampling another tag's exchange.
+                    self.reset_protocol_state();
+                    (Some(RangingEvent::ExchangeTimedOut), TickAction::None)
+                }
+                _ => (None, TickAction::None),
+            };
+        }
+
         if now_ms.saturating_sub(self.last_tick_ms) < self.config.timer_period_ms {
             return (None, TickAction::None);
         }
         self.last_tick_ms = now_ms;
 
-        let mut action = TickAction::None;
-        if self.role == Role::Tag {
-            if !self.peers.is_empty() && self.blink_counter != 0 {
-                self.expected = FrameKind::PollAck;
-                self.poll_acknowledged.clear();
-                action = TickAction::Poll;
-            } else {
-                action = TickAction::Blink;
+        if self.role == Role::Anchor {
+            // Broadcast the schedule preferably while no exchange is in
+            // progress and the channel has been quiet for a tick period, so
+            // the sync frame does not collide with poll-acks or reports.
+            // These are soft gates only: a stalled exchange (range frame
+            // lost, tag switched off) or a busy channel may delay the sync
+            // but must never starve it, because tags stay silent until they
+            // hear the schedule.
+            if self.config.anchor_is_coordinator {
+                let since_sync_ms = now_ms.wrapping_sub(self.last_schedule_sync_ms);
+                if since_sync_ms >= self.config.schedule.range_period_ms {
+                    let overdue = since_sync_ms
+                        >= self.config.schedule.range_period_ms.saturating_mul(4);
+                    let freshness_bound_ms =
+                        self.config.schedule.session_timeout_ms.saturating_mul(2);
+                    let exchange_active = self.peers.iter().any(|peer| {
+                        peer.awaiting_range
+                            && now_ms.wrapping_sub(peer.poll_received_ms) <= freshness_bound_ms
+                    });
+                    let quiet = now_ms.wrapping_sub(self.last_activity_ms)
+                        >= self.config.timer_period_ms;
+                    if overdue || (!exchange_active && quiet) {
+                        self.last_schedule_sync_ms = now_ms;
+                        return (None, TickAction::ScheduleSync);
+                    }
+                }
             }
-            self.last_range_start_ms = now_ms;
-            self.blink_counter = if self.blink_counter >= 20 {
-                0
-            } else {
-                self.blink_counter + 1
-            };
+            return (None, TickAction::None);
         }
+
+        if self.expected != FrameKind::Blink {
+            if now_ms.wrapping_sub(self.exchange_started_ms) >= self.config.exchange_timeout_ms {
+                self.reset_protocol_state();
+                return (Some(RangingEvent::ExchangeTimedOut), TickAction::None);
+            }
+            return (None, TickAction::None);
+        }
+
+        if !self.tag_slot_is_open(now_ms)
+            || now_ms.wrapping_sub(self.last_range_start_ms) < self.config.schedule.range_period_ms
+        {
+            return (None, TickAction::None);
+        }
+
+        self.last_range_start_ms = now_ms;
+        let action = if !self.peers.is_empty() && self.blink_counter != 0 {
+            self.begin_poll_ack_phase(now_ms);
+            TickAction::Poll
+        } else {
+            TickAction::Blink
+        };
+        self.blink_counter = if self.blink_counter >= 20 {
+            0
+        } else {
+            self.blink_counter + 1
+        };
         (None, action)
     }
 
@@ -647,6 +758,22 @@ impl<const N: usize> RangingNode<N> {
         )?;
         self.last_tx_kind = Some(FrameKind::RangingInit);
         self.last_tx_destination = destination_short;
+        Ok(PendingTx { frame, len })
+    }
+
+    fn build_schedule_sync(&mut self, now_ms: u32) -> Result<PendingTx, ProtocolError> {
+        let mut frame = [0u8; MAX_FRAME_LEN];
+        let len = encode_schedule_sync(
+            self.next_sequence(),
+            self.config.identity.short_address,
+            ShortAddress::BROADCAST,
+            now_ms,
+            self.config.schedule.tag_slot_count,
+            self.config.schedule.tag_slot_ms,
+            &mut frame,
+        )?;
+        self.last_tx_kind = Some(FrameKind::ScheduleSync);
+        self.last_tx_destination = ShortAddress::BROADCAST;
         Ok(PendingTx { frame, len })
     }
 
@@ -702,15 +829,19 @@ impl<const N: usize> RangingNode<N> {
             poll_ack_received: DwTime::zero(),
             range_sent: DwTime::zero(),
         }; N];
-        for (index, peer) in self.peers.iter().enumerate() {
-            timings[index] = RangeTiming {
+        let mut count = 0;
+        for short in self.poll_acknowledged.iter().copied() {
+            let Some(peer) = self.peers.iter().find(|peer| peer.short_address == short) else {
+                continue;
+            };
+            timings[count] = RangeTiming {
                 short_address: peer.short_address,
                 poll_sent: peer.poll_sent,
                 poll_ack_received: peer.poll_ack_received,
                 range_sent: predicted_tx,
             };
+            count += 1;
         }
-        let count = self.peers.len();
         let len = encode_range(
             self.next_sequence(),
             self.config.identity.short_address,
@@ -792,6 +923,9 @@ impl<const N: usize> RangingNode<N> {
         if !observe_peer_sequence(peer, blink.sequence) {
             return Ok(None);
         }
+        // A blink restarts discovery for this tag, so drop any exchange
+        // still pending with it.
+        peer.awaiting_range = false;
         Ok(Some(PeerSnapshot::from(&*peer)))
     }
 
@@ -865,61 +999,59 @@ impl<const N: usize> RangingNode<N> {
         destination == self.config.identity.eui
     }
 
+    fn observe_schedule_sync(&self, sync: ScheduleSyncFrame) -> Option<ShortAddress> {
+        self.matches_short_destination(sync.header.destination, true)
+            .then_some(sync.header.source)
+    }
+
+    fn accept_schedule_sync(&mut self, sync: ScheduleSyncFrame, now_ms: u32) {
+        // Dedup against an existing peer entry, but never create one here:
+        // the coordinator may not know this tag yet, and a peer added before
+        // discovery would be polled without ever acknowledging.
+        if let Some(peer) = self.peer_mut(sync.header.source) {
+            peer.last_activity_ms = now_ms;
+            if !observe_peer_sequence(peer, sync.header.sequence) {
+                return;
+            }
+        }
+        let frame_ms = u32::from(sync.tag_slot_count).saturating_mul(sync.tag_slot_ms);
+        self.schedule_epoch_ms = Some(if frame_ms == 0 {
+            now_ms
+        } else {
+            now_ms.wrapping_sub(sync.epoch_ms % frame_ms)
+        });
+    }
+
     fn reset_protocol_state(&mut self) {
         self.expected = match self.role {
-            Role::Tag => FrameKind::PollAck,
+            Role::Tag => FrameKind::Blink,
             Role::Anchor => FrameKind::Poll,
         };
+        for peer in self.peers.iter_mut() {
+            peer.awaiting_range = false;
+        }
         self.last_tx_kind = None;
         self.last_tx_destination = ShortAddress::BROADCAST;
         self.poll_acknowledged.clear();
-        self.range_report_received.clear();
+        self.range_reports_received.clear();
+        self.exchange_started_ms = 0;
         self.session_deadline_ms = None;
     }
 
     fn begin_poll_ack_phase(&mut self, now_ms: u32) {
         self.expected = FrameKind::PollAck;
         self.poll_acknowledged.clear();
-        self.range_report_received.clear();
+        self.range_reports_received.clear();
+        self.exchange_started_ms = now_ms;
         self.session_deadline_ms =
             Some(now_ms.wrapping_add(self.config.schedule.session_timeout_ms));
     }
 
     fn begin_range_report_phase(&mut self, now_ms: u32) {
         self.expected = FrameKind::RangeReport;
-        self.range_report_received.clear();
+        self.range_reports_received.clear();
         self.session_deadline_ms =
             Some(now_ms.wrapping_add(self.config.schedule.session_timeout_ms));
-    }
-
-    fn finish_timed_out_session<R, SpiE, PinE>(
-        &mut self,
-        radio: &mut R,
-        now_ms: u32,
-    ) -> Result<bool, Error<SpiE, PinE>>
-    where
-        R: RangingRadio<SpiE, PinE>,
-    {
-        if !self.session_expired(now_ms) {
-            return Ok(false);
-        }
-        match (self.role, self.expected) {
-            (Role::Tag, FrameKind::PollAck) if !self.poll_acknowledged.is_empty() => {
-                self.begin_range_report_phase(now_ms);
-                self.send_range(radio, None)?;
-                Ok(true)
-            }
-            (Role::Tag, FrameKind::PollAck | FrameKind::RangeReport) => {
-                self.reset_protocol_state();
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
-    }
-
-    fn session_active(&self) -> bool {
-        matches!(self.expected, FrameKind::PollAck | FrameKind::RangeReport)
-            && self.session_deadline_ms.is_some()
     }
 
     fn session_expired(&self, now_ms: u32) -> bool {
@@ -930,23 +1062,27 @@ impl<const N: usize> RangingNode<N> {
 
     fn tag_slot_is_open(&self, now_ms: u32) -> bool {
         let count = u32::from(self.config.schedule.tag_slot_count.max(1));
-        if count <= 1 {
-            return true;
-        }
         let slot_ms = self.config.schedule.tag_slot_ms;
-        if slot_ms == 0 {
+        if count <= 1 || slot_ms == 0 {
             return true;
         }
+        // Never transmit before the coordinator schedule is known: an
+        // unsynced tag would collide with every other tag on the PAN.
+        let Some(epoch) = self.schedule_epoch_ms else {
+            return false;
+        };
         let tag_slot = u32::from(self.config.schedule.tag_slot).min(count - 1);
-        let epoch = self.schedule_epoch_ms.unwrap_or(0);
-        let current_slot = (now_ms.wrapping_sub(epoch) / slot_ms) % count;
-        current_slot == tag_slot
-    }
-
-    fn anchor_discovery_delay(&self) -> Option<DwTime> {
-        let delay_us = u32::from(self.config.schedule.anchor_slot)
-            .saturating_mul(self.config.schedule.discovery_slot_spacing_us);
-        (delay_us != 0).then(|| DwTime::from_micros(delay_us as f32))
+        let elapsed_in_frame = now_ms.wrapping_sub(epoch) % (count * slot_ms);
+        if elapsed_in_frame / slot_ms != tag_slot {
+            return false;
+        }
+        // Only start an exchange while enough of the slot remains for both
+        // collection phases, so it cannot spill into the next tag's slot.
+        // Slots too short to ever satisfy the budget degrade to the bare
+        // slot check instead of silencing the tag entirely.
+        let exchange_budget_ms = self.config.schedule.session_timeout_ms.saturating_mul(2);
+        let remaining_ms = slot_ms - elapsed_in_frame % slot_ms;
+        exchange_budget_ms >= slot_ms || remaining_ms >= exchange_budget_ms
     }
 }
 
@@ -1030,9 +1166,6 @@ impl<const N: usize> RangingNode<N> {
         R: RangingRadio<SpiE, PinE>,
     {
         let (event, action) = self.process_tick(now_ms);
-        if event.is_some() {
-            return Ok(event);
-        }
         match action {
             TickAction::None => {}
             TickAction::Blink => {
@@ -1043,8 +1176,18 @@ impl<const N: usize> RangingNode<N> {
                 let tx = self.build_poll()?;
                 radio.transmit(&tx.frame[..tx.len], TxOptions::default())?;
             }
+            TickAction::Range => self.execute_reply(
+                radio,
+                Reply::Range {
+                    reply_delay_us: self.config.reply_delay_us,
+                },
+            )?,
+            TickAction::ScheduleSync => {
+                let tx = self.build_schedule_sync(now_ms)?;
+                radio.transmit(&tx.frame[..tx.len], TxOptions::default())?;
+            }
         }
-        Ok(None)
+        Ok(event)
     }
 
     fn execute_reply<R, SpiE, PinE>(
@@ -1057,9 +1200,19 @@ impl<const N: usize> RangingNode<N> {
     {
         match reply {
             Reply::None => Ok(()),
-            Reply::RangingInit { eui, short } => {
+            Reply::RangingInit {
+                eui,
+                short,
+                reply_delay_us,
+            } => {
                 let tx = self.build_ranging_init(eui, short)?;
-                radio.transmit(&tx.frame[..tx.len], TxOptions::default())
+                if reply_delay_us == 0 {
+                    radio.transmit(&tx.frame[..tx.len], TxOptions::default())
+                } else {
+                    let scheduled =
+                        radio.schedule_delayed(DwTime::from_micros(reply_delay_us as f32))?;
+                    radio.transmit(&tx.frame[..tx.len], delayed_tx_options(scheduled))
+                }
             }
             Reply::PollAck {
                 destination,
@@ -1174,9 +1327,6 @@ impl<const N: usize> RangingNode<N> {
         R: AsyncRangingRadio<SpiE, PinE>,
     {
         let (event, action) = self.process_tick(now_ms);
-        if event.is_some() {
-            return Ok(event);
-        }
         match action {
             TickAction::None => {}
             TickAction::Blink => {
@@ -1191,8 +1341,23 @@ impl<const N: usize> RangingNode<N> {
                     .transmit(&tx.frame[..tx.len], TxOptions::default())
                     .await?;
             }
+            TickAction::Range => {
+                self.execute_reply_async(
+                    radio,
+                    Reply::Range {
+                        reply_delay_us: self.config.reply_delay_us,
+                    },
+                )
+                .await?;
+            }
+            TickAction::ScheduleSync => {
+                let tx = self.build_schedule_sync(now_ms)?;
+                radio
+                    .transmit(&tx.frame[..tx.len], TxOptions::default())
+                    .await?;
+            }
         }
-        Ok(None)
+        Ok(event)
     }
 
     async fn execute_reply_async<R, SpiE, PinE>(
@@ -1205,11 +1370,24 @@ impl<const N: usize> RangingNode<N> {
     {
         match reply {
             Reply::None => Ok(()),
-            Reply::RangingInit { eui, short } => {
+            Reply::RangingInit {
+                eui,
+                short,
+                reply_delay_us,
+            } => {
                 let tx = self.build_ranging_init(eui, short)?;
-                radio
-                    .transmit(&tx.frame[..tx.len], TxOptions::default())
-                    .await
+                if reply_delay_us == 0 {
+                    radio
+                        .transmit(&tx.frame[..tx.len], TxOptions::default())
+                        .await
+                } else {
+                    let scheduled = radio
+                        .schedule_delayed(DwTime::from_micros(reply_delay_us as f32))
+                        .await?;
+                    radio
+                        .transmit(&tx.frame[..tx.len], delayed_tx_options(scheduled))
+                        .await
+                }
             }
             Reply::PollAck {
                 destination,

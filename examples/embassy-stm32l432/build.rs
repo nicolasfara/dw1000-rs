@@ -1,127 +1,163 @@
 use std::{env, fs, path::PathBuf};
 
-const DEFAULT_ANCHOR_PAN_ID: u16 = 0x0D57;
-const DEFAULT_ANCHOR_SHORT_ADDRESS: u16 = 3344;
-const DEFAULT_ANCHOR_EUI: [u8; 8] = [0xB1, 0x4A, 0x7C, 0x00, 0x11, 0x22, 0x33, 0x44];
-const DEFAULT_ANCHOR_SLOT: u8 = 0;
-const DEFAULT_ANCHOR_COORDINATOR: bool = false;
-const DEFAULT_TAG_PAN_ID: u16 = 0x0D57;
-const DEFAULT_TAG_SHORT_ADDRESS: u16 = 3400;
+const DEFAULT_PAN_ID: u16 = 0x0D57;
+const DEFAULT_SHORT_ADDRESS: u16 = 3344;
+const DEFAULT_EUI: [u8; 8] = [0xB1, 0x4A, 0x7C, 0x00, 0x11, 0x22, 0x33, 0x44];
+const DEFAULT_TAG_SHORT_ADDRESS: u16 = 3345;
 const DEFAULT_TAG_EUI: [u8; 8] = [0x82, 0x17, 0x5B, 0xD5, 0xA9, 0x9A, 0xE2, 0x9C];
-const DEFAULT_TAG_SLOT: u8 = 0;
-const DEFAULT_TAG_SLOT_COUNT: u8 = 2;
-const DEFAULT_TAG_SLOT_MS: u32 = 250;
-const DEFAULT_DISCOVERY_SLOT_SPACING_US: u32 = 12_000;
-const DEFAULT_SESSION_TIMEOUT_MS: u32 = 180;
-const DEFAULT_RANGE_PERIOD_MS: u32 = 260;
+const DEFAULT_ANTENNA_DELAY: u16 = 16_456;
+const DEFAULT_DISCOVERY_REPLY_DELAY_US: u16 = 7_000;
+const DEFAULT_ANCHOR_COORDINATOR: bool = false;
+const DEFAULT_TAG_SLOT: u16 = 0;
+const DEFAULT_TAG_SLOT_COUNT: u16 = 1;
+const DEFAULT_TAG_SLOT_MS: u16 = 250;
+/// Twice the session timeout configured in `src/lib.rs`
+/// (`RANGING_SESSION_TIMEOUT_MS`): the minimum slot budget one exchange needs.
+const MIN_SHARED_SLOT_MS: u16 = 160;
 
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR not set"));
     fs::write(out.join("memory.x"), include_bytes!("memory.x")).expect("write memory.x");
-    fs::write(out.join("anchor_identity.rs"), anchor_identity()).expect("write anchor_identity.rs");
-    fs::write(out.join("tag_identity.rs"), tag_identity()).expect("write tag_identity.rs");
+    fs::write(out.join("anchor_config.rs"), anchor_config()).expect("write anchor config");
+    fs::write(out.join("tag_config.rs"), tag_config()).expect("write tag config");
+    fs::write(out.join("schedule_config.rs"), schedule_config()).expect("write schedule config");
     println!("cargo:rustc-link-search={}", out.display());
     println!("cargo:rerun-if-changed=memory.x");
-    println!("cargo:rerun-if-env-changed=DW1000_ANCHOR_PAN_ID");
-    println!("cargo:rerun-if-env-changed=DW1000_ANCHOR_SHORT");
-    println!("cargo:rerun-if-env-changed=DW1000_ANCHOR_EUI");
-    println!("cargo:rerun-if-env-changed=DW1000_ANCHOR_SLOT");
-    println!("cargo:rerun-if-env-changed=DW1000_ANCHOR_COORDINATOR");
-    println!("cargo:rerun-if-env-changed=DW1000_TAG_PAN_ID");
-    println!("cargo:rerun-if-env-changed=DW1000_TAG_SHORT");
-    println!("cargo:rerun-if-env-changed=DW1000_TAG_EUI");
-    println!("cargo:rerun-if-env-changed=DW1000_TAG_SLOT");
-    println!("cargo:rerun-if-env-changed=DW1000_TAG_SLOT_COUNT");
-    println!("cargo:rerun-if-env-changed=DW1000_TAG_SLOT_MS");
-    println!("cargo:rerun-if-env-changed=DW1000_DISCOVERY_SLOT_SPACING_US");
-    println!("cargo:rerun-if-env-changed=DW1000_SESSION_TIMEOUT_MS");
-    println!("cargo:rerun-if-env-changed=DW1000_RANGE_PERIOD_MS");
+    for variable in [
+        "DW1000_ANCHOR_PAN_ID",
+        "DW1000_ANCHOR_SHORT",
+        "DW1000_ANCHOR_EUI",
+        "DW1000_ANCHOR_ANTENNA_DELAY",
+        "DW1000_ANCHOR_DISCOVERY_REPLY_DELAY_US",
+        "DW1000_ANCHOR_COORDINATOR",
+        "DW1000_TAG_PAN_ID",
+        "DW1000_TAG_SHORT",
+        "DW1000_TAG_EUI",
+        "DW1000_TAG_ANTENNA_DELAY",
+        "DW1000_TAG_SLOT",
+        "DW1000_TAG_SLOT_COUNT",
+        "DW1000_TAG_SLOT_MS",
+    ] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
 }
 
-fn anchor_identity() -> String {
-    let pan_id = env_u16("DW1000_ANCHOR_PAN_ID", DEFAULT_ANCHOR_PAN_ID);
-    let short_address = env_u16("DW1000_ANCHOR_SHORT", DEFAULT_ANCHOR_SHORT_ADDRESS);
-    let eui = env_eui("DW1000_ANCHOR_EUI", DEFAULT_ANCHOR_EUI);
-    let anchor_slot = env_u8("DW1000_ANCHOR_SLOT", DEFAULT_ANCHOR_SLOT);
-    let anchor_coordinator = env_bool(
-        "DW1000_ANCHOR_COORDINATOR",
-        DEFAULT_ANCHOR_COORDINATOR,
+fn anchor_config() -> String {
+    let pan_id = env_u16("DW1000_ANCHOR_PAN_ID", DEFAULT_PAN_ID);
+    let short_address = env_u16("DW1000_ANCHOR_SHORT", DEFAULT_SHORT_ADDRESS);
+    let eui = env_eui("DW1000_ANCHOR_EUI", DEFAULT_EUI);
+    let antenna_delay = env_u16("DW1000_ANCHOR_ANTENNA_DELAY", DEFAULT_ANTENNA_DELAY);
+    let discovery_reply_delay_us = env_u16(
+        "DW1000_ANCHOR_DISCOVERY_REPLY_DELAY_US",
+        default_discovery_reply_delay_us(short_address),
     );
-    let tag_slot_count = env_u8("DW1000_TAG_SLOT_COUNT", DEFAULT_TAG_SLOT_COUNT);
-    let tag_slot_ms = env_u32("DW1000_TAG_SLOT_MS", DEFAULT_TAG_SLOT_MS);
-    let discovery_slot_spacing_us = env_u32(
-        "DW1000_DISCOVERY_SLOT_SPACING_US",
-        DEFAULT_DISCOVERY_SLOT_SPACING_US,
-    );
-    let session_timeout_ms = env_u32("DW1000_SESSION_TIMEOUT_MS", DEFAULT_SESSION_TIMEOUT_MS);
-    let range_period_ms = env_u32("DW1000_RANGE_PERIOD_MS", DEFAULT_RANGE_PERIOD_MS);
+    let anchor_is_coordinator = env_bool("DW1000_ANCHOR_COORDINATOR", DEFAULT_ANCHOR_COORDINATOR);
 
-    if short_address == 0xFFFF {
-        panic!("DW1000_ANCHOR_SHORT must not be the broadcast address 0xFFFF");
-    }
-    if tag_slot_count == 0 {
-        panic!("DW1000_TAG_SLOT_COUNT must be at least 1");
-    }
+    assert_ne!(
+        short_address, 0xFFFF,
+        "DW1000_ANCHOR_SHORT must not be the broadcast address"
+    );
 
     format!(
-        "const ANCHOR_PAN_ID: u16 = {pan_id};\n\
-         const ANCHOR_SHORT_ADDRESS: u16 = {short_address};\n\
-         const ANCHOR_EUI: [u8; 8] = [{eui}];\n\
-         const ANCHOR_SLOT: u8 = {anchor_slot};\n\
-         const ANCHOR_COORDINATOR: bool = {anchor_coordinator};\n\
-         const TAG_SLOT_COUNT: u8 = {tag_slot_count};\n\
-         const TAG_SLOT_MS: u32 = {tag_slot_ms};\n\
-         const DISCOVERY_SLOT_SPACING_US: u32 = {discovery_slot_spacing_us};\n\
-         const SESSION_TIMEOUT_MS: u32 = {session_timeout_ms};\n\
-         const RANGE_PERIOD_MS: u32 = {range_period_ms};\n",
-        eui = eui
-            .iter()
-            .map(|byte| format!("0x{byte:02X}"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        "const ANCHOR_CONFIG: NodeConfig = NodeConfig {{\n\
+             identity: DeviceIdentity::new(\n\
+                 PanId::new({pan_id}),\n\
+                 ShortAddress::new({short_address}),\n\
+                 Eui64::new([{eui}]),\n\
+             ),\n\
+             antenna_delay: AntennaDelay::new({antenna_delay}),\n\
+             discovery_reply_delay_us: {discovery_reply_delay_us},\n\
+             anchor_is_coordinator: {anchor_is_coordinator},\n\
+             tag_slot: 0,\n\
+         }};\n",
+        eui = format_eui(&eui),
     )
 }
 
-fn tag_identity() -> String {
-    let pan_id = env_u16("DW1000_TAG_PAN_ID", DEFAULT_TAG_PAN_ID);
+fn tag_config() -> String {
+    let pan_id = env_u16("DW1000_TAG_PAN_ID", DEFAULT_PAN_ID);
     let short_address = env_u16("DW1000_TAG_SHORT", DEFAULT_TAG_SHORT_ADDRESS);
     let eui = env_eui("DW1000_TAG_EUI", DEFAULT_TAG_EUI);
-    let tag_slot = env_u8("DW1000_TAG_SLOT", DEFAULT_TAG_SLOT);
-    let tag_slot_count = env_u8("DW1000_TAG_SLOT_COUNT", DEFAULT_TAG_SLOT_COUNT);
-    let tag_slot_ms = env_u32("DW1000_TAG_SLOT_MS", DEFAULT_TAG_SLOT_MS);
-    let discovery_slot_spacing_us = env_u32(
-        "DW1000_DISCOVERY_SLOT_SPACING_US",
-        DEFAULT_DISCOVERY_SLOT_SPACING_US,
-    );
-    let session_timeout_ms = env_u32("DW1000_SESSION_TIMEOUT_MS", DEFAULT_SESSION_TIMEOUT_MS);
-    let range_period_ms = env_u32("DW1000_RANGE_PERIOD_MS", DEFAULT_RANGE_PERIOD_MS);
+    let antenna_delay = env_u16("DW1000_TAG_ANTENNA_DELAY", DEFAULT_ANTENNA_DELAY);
+    let tag_slot = env_u16("DW1000_TAG_SLOT", DEFAULT_TAG_SLOT);
+    let tag_slot_count = env_u16("DW1000_TAG_SLOT_COUNT", DEFAULT_TAG_SLOT_COUNT);
 
-    if short_address == 0xFFFF {
-        panic!("DW1000_TAG_SHORT must not be the broadcast address 0xFFFF");
-    }
-    if tag_slot_count == 0 {
-        panic!("DW1000_TAG_SLOT_COUNT must be at least 1");
-    }
-    if tag_slot >= tag_slot_count {
-        panic!("DW1000_TAG_SLOT must be less than DW1000_TAG_SLOT_COUNT");
-    }
+    assert_ne!(
+        short_address, 0xFFFF,
+        "DW1000_TAG_SHORT must not be the broadcast address"
+    );
+    assert!(
+        tag_slot < tag_slot_count,
+        "DW1000_TAG_SLOT must be lower than DW1000_TAG_SLOT_COUNT"
+    );
 
     format!(
-        "const TAG_PAN_ID: u16 = {pan_id};\n\
-         const TAG_SHORT_ADDRESS: u16 = {short_address};\n\
-         const TAG_EUI: [u8; 8] = [{eui}];\n\
-         const TAG_SLOT: u8 = {tag_slot};\n\
-         const TAG_SLOT_COUNT: u8 = {tag_slot_count};\n\
-         const TAG_SLOT_MS: u32 = {tag_slot_ms};\n\
-         const DISCOVERY_SLOT_SPACING_US: u32 = {discovery_slot_spacing_us};\n\
-         const SESSION_TIMEOUT_MS: u32 = {session_timeout_ms};\n\
-         const RANGE_PERIOD_MS: u32 = {range_period_ms};\n",
-        eui = eui
-            .iter()
-            .map(|byte| format!("0x{byte:02X}"))
-            .collect::<Vec<_>>()
-            .join(", ")
+        "const TAG_CONFIG: NodeConfig = NodeConfig {{\n\
+             identity: DeviceIdentity::new(\n\
+                 PanId::new({pan_id}),\n\
+                 ShortAddress::new({short_address}),\n\
+                 Eui64::new([{eui}]),\n\
+             ),\n\
+             antenna_delay: AntennaDelay::new({antenna_delay}),\n\
+             discovery_reply_delay_us: 0,\n\
+             anchor_is_coordinator: false,\n\
+             tag_slot: {tag_slot},\n\
+         }};\n",
+        eui = format_eui(&eui),
     )
+}
+
+/// TDMA schedule shared by every node on the PAN. Tags use it to pick their
+/// transmit windows; the coordinator anchor broadcasts it, so build all
+/// binaries with the same `DW1000_TAG_SLOT_COUNT` and `DW1000_TAG_SLOT_MS`.
+fn schedule_config() -> String {
+    let tag_slot_count = env_u16("DW1000_TAG_SLOT_COUNT", DEFAULT_TAG_SLOT_COUNT);
+    let tag_slot_ms = env_u16("DW1000_TAG_SLOT_MS", DEFAULT_TAG_SLOT_MS);
+
+    assert!(
+        (1..=255).contains(&tag_slot_count),
+        "DW1000_TAG_SLOT_COUNT must be between 1 and 255"
+    );
+    assert!(
+        tag_slot_count == 1 || tag_slot_ms >= MIN_SHARED_SLOT_MS,
+        "DW1000_TAG_SLOT_MS must be at least {MIN_SHARED_SLOT_MS} ms when several tags share the PAN"
+    );
+
+    format!(
+        "const TAG_SLOT_COUNT: u8 = {tag_slot_count};\n\
+         const TAG_SLOT_MS: u32 = {tag_slot_ms};\n"
+    )
+}
+
+fn format_eui(eui: &[u8; 8]) -> String {
+    eui.iter()
+        .map(|byte| format!("0x{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Staggers the discovery reply slot by short address so anchors flashed with
+/// only a distinct `DW1000_ANCHOR_SHORT` never answer the same blink in the
+/// same slot. Anchors whose short addresses are congruent modulo 8 would
+/// still collide; set `DW1000_ANCHOR_DISCOVERY_REPLY_DELAY_US` explicitly for
+/// those.
+fn default_discovery_reply_delay_us(short_address: u16) -> u16 {
+    DEFAULT_DISCOVERY_REPLY_DELAY_US * (1 + short_address % 8)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    let Some(raw) = env::var_os(name) else {
+        return default;
+    };
+    match raw
+        .to_str()
+        .unwrap_or_else(|| panic!("{name} must be valid UTF-8"))
+        .trim()
+    {
+        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => true,
+        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => false,
+        value => panic!("{name} must be boolean, got {value:?}"),
+    }
 }
 
 fn env_u16(name: &str, default: u16) -> u16 {
@@ -131,66 +167,13 @@ fn env_u16(name: &str, default: u16) -> u16 {
     let raw = raw
         .to_str()
         .unwrap_or_else(|| panic!("{name} must be valid UTF-8"));
-    parse_u16(raw).unwrap_or_else(|| panic!("{name} must be a u16, got {raw:?}"))
-}
-
-fn env_u8(name: &str, default: u8) -> u8 {
-    let Some(raw) = env::var_os(name) else {
-        return default;
-    };
-    let raw = raw
-        .to_str()
-        .unwrap_or_else(|| panic!("{name} must be valid UTF-8"));
-    parse_u16(raw)
-        .and_then(|value| u8::try_from(value).ok())
-        .unwrap_or_else(|| panic!("{name} must be a u8, got {raw:?}"))
-}
-
-fn env_u32(name: &str, default: u32) -> u32 {
-    let Some(raw) = env::var_os(name) else {
-        return default;
-    };
-    let raw = raw
-        .to_str()
-        .unwrap_or_else(|| panic!("{name} must be valid UTF-8"));
-    parse_u32(raw).unwrap_or_else(|| panic!("{name} must be a u32, got {raw:?}"))
-}
-
-fn env_bool(name: &str, default: bool) -> bool {
-    let Some(raw) = env::var_os(name) else {
-        return default;
-    };
-    let raw = raw
-        .to_str()
-        .unwrap_or_else(|| panic!("{name} must be valid UTF-8"))
-        .trim();
-    match raw {
-        "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON" => true,
-        "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF" => false,
-        _ => panic!("{name} must be boolean, got {raw:?}"),
-    }
-}
-
-fn parse_u16(raw: &str) -> Option<u16> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
-        return u16::from_str_radix(hex, 16).ok();
-    }
-    raw.parse().ok()
-}
-
-fn parse_u32(raw: &str) -> Option<u32> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
-        return u32::from_str_radix(hex, 16).ok();
-    }
-    raw.parse().ok()
+    let value = raw.trim();
+    let value = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(|| value.parse(), |hex| u16::from_str_radix(hex, 16))
+        .unwrap_or_else(|_| panic!("{name} must be a u16, got {raw:?}"));
+    value
 }
 
 fn env_eui(name: &str, default: [u8; 8]) -> [u8; 8] {
@@ -199,32 +182,27 @@ fn env_eui(name: &str, default: [u8; 8]) -> [u8; 8] {
     };
     let raw = raw
         .to_str()
-        .unwrap_or_else(|| panic!("{name} must be valid UTF-8"));
-    parse_eui(raw).unwrap_or_else(|| {
-        panic!("{name} must contain exactly 8 hex bytes, got {raw:?}");
-    })
-}
-
-fn parse_eui(raw: &str) -> Option<[u8; 8]> {
-    let mut hex = String::with_capacity(16);
-    for ch in raw.trim().chars() {
-        if matches!(ch, ':' | '-' | '_' | ' ') {
-            continue;
-        }
-        hex.push(ch);
-    }
-    let hex = hex
+        .unwrap_or_else(|| panic!("{name} must be valid UTF-8"))
+        .trim();
+    let raw = raw
         .strip_prefix("0x")
-        .or_else(|| hex.strip_prefix("0X"))
-        .unwrap_or(&hex);
-    if hex.len() != 16 || !hex.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        return None;
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
+    let mut digits = String::with_capacity(16);
+    for character in raw.chars() {
+        if character.is_ascii_hexdigit() {
+            digits.push(character);
+        } else if !matches!(character, ':' | '-' | '_' | ' ') {
+            panic!("{name} contains an invalid character");
+        }
     }
+    assert_eq!(digits.len(), 16, "{name} must contain exactly 8 bytes");
 
-    let mut eui = [0u8; 8];
+    let mut eui = [0; 8];
     for (index, byte) in eui.iter_mut().enumerate() {
-        let start = index * 2;
-        *byte = u8::from_str_radix(&hex[start..start + 2], 16).ok()?;
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&digits[offset..offset + 2], 16)
+            .unwrap_or_else(|_| panic!("{name} must contain hexadecimal bytes"));
     }
-    Some(eui)
+    eui
 }

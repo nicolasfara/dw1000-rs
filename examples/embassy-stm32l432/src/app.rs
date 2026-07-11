@@ -2,15 +2,18 @@ use defmt::{info, warn};
 use dw1000_rs::registers::status;
 use dw1000_rs::{
     AntennaDelay, DeviceIdentity, Error, OperatingMode, RadioConfig, RangingConfig, RangingEvent,
-    RangingNode, RangingSchedule, Role, SysStatus,
+    RangingNode, Role, RxError, SysStatus,
 };
+use dw1000_rs::protocol::FrameKind;
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Ticker};
 
 use crate::board::Board;
+use crate::nodes::NodeConfig;
 use crate::{
-    DW1000_LINK_RECOVERY_TIMEOUT_MS, PEER_INACTIVITY_TIMEOUT_MS, RANGING_REPLY_DELAY_US,
-    RX_BUFFER_LEN,
+    DW1000_LINK_RECOVERY_TIMEOUT_MS, PEER_INACTIVITY_TIMEOUT_MS, RANGING_EXCHANGE_TIMEOUT_MS,
+    RANGING_PERIOD_MS, RANGING_REPLY_DELAY_US, RANGING_SESSION_TIMEOUT_MS, RX_BUFFER_LEN,
+    TAG_SLOT_COUNT, TAG_SLOT_MS,
 };
 
 const ANCHOR_HEARTBEAT_PERIOD_MS: u32 = 1_000;
@@ -30,6 +33,8 @@ pub(crate) struct RangingApp<const N: usize> {
     last_schedule_sync_source: Option<dw1000_rs::ShortAddress>,
     last_schedule_sync_ms: Option<u32>,
     schedule_sync_count: u32,
+    schedule_sync_tx_count: u32,
+    rx_event_count: u32,
 }
 
 pub(crate) struct AppInitError {
@@ -41,6 +46,16 @@ struct RecoverReason {
     now_ms: u32,
     message: &'static str,
 }
+
+// These are the IRQ causes for which `read_frame` can either return a frame
+// or report a concrete RX error. Detection-progress bits are intentionally
+// excluded because a frame is not ready to read yet.
+const RX_WORK_EVENTS: SysStatus = SysStatus(
+    status::RX_FRAME_READY.0
+        | status::RX_FRAME_GOOD.0
+        | status::ALL_RX_ERRORS.0
+        | status::ALL_RX_TIMEOUTS.0,
+);
 
 enum StepOutcome {
     Idle,
@@ -62,18 +77,22 @@ impl<const N: usize> RangingApp<N> {
     pub(crate) async fn new(
         mut board: Board,
         role: Role,
-        identity: DeviceIdentity,
-        antenna_delay: AntennaDelay,
-        schedule: RangingSchedule,
-        anchor_is_coordinator: bool,
+        node_config: NodeConfig,
     ) -> Result<Self, AppInitError> {
+        let identity = node_config.identity;
+        let antenna_delay = node_config.antenna_delay;
         board.announce_start(role, identity, antenna_delay);
 
         let radio_config = default_radio_config(identity, antenna_delay);
-        let ranging_config = default_ranging_config(identity, schedule, anchor_is_coordinator);
+        let ranging_config = default_ranging_config(&node_config);
         let mut node = RangingNode::<N>::new(role, ranging_config);
 
-        if board.radio.init(&mut embassy_time::Delay, &radio_config).await.is_err() {
+        if board
+            .radio
+            .init(&mut embassy_time::Delay, &radio_config)
+            .await
+            .is_err()
+        {
             return Err(AppInitError {
                 board,
                 message: "dw1000 init failed",
@@ -92,6 +111,12 @@ impl<const N: usize> RangingApp<N> {
                 message: "ranging start failed",
             });
         }
+        if role == Role::Anchor {
+            info!(
+                "anchor coordinator={=bool}",
+                node_config.anchor_is_coordinator
+            );
+        }
 
         if role == Role::Anchor {
             info!(
@@ -106,7 +131,7 @@ impl<const N: usize> RangingApp<N> {
             board,
             role,
             identity,
-            anchor_is_coordinator,
+            anchor_is_coordinator: node_config.anchor_is_coordinator,
             radio_config,
             node,
             rx_buffer: [0; RX_BUFFER_LEN],
@@ -117,6 +142,8 @@ impl<const N: usize> RangingApp<N> {
             last_schedule_sync_source: None,
             last_schedule_sync_ms: None,
             schedule_sync_count: 0,
+            schedule_sync_tx_count: 0,
+            rx_event_count: 0,
         })
     }
 
@@ -128,10 +155,17 @@ impl<const N: usize> RangingApp<N> {
     }
 
     async fn step(&mut self) {
-        let now = now_ms();
+        // Capture the timestamp after the await: the select can park for a
+        // whole ticker period, and TDMA slot scheduling needs a fresh clock.
         match select(self.ticker.next(), self.board.radio.wait_for_irq()).await {
-            Either::First(_) => self.handle_tick(now).await,
-            Either::Second(irq_result) => self.handle_irq(irq_result, now).await,
+            Either::First(_) => {
+                let now = now_ms();
+                self.handle_tick(now).await;
+            }
+            Either::Second(irq_result) => {
+                let now = now_ms();
+                self.handle_irq(irq_result, now).await;
+            }
         }
     }
 
@@ -139,9 +173,17 @@ impl<const N: usize> RangingApp<N> {
         let tx_before = self.node.tx_debug_snapshot();
         match self.node.tick_async(&mut self.board.radio, now).await {
             Ok(event) => {
+                let tx_after = self.node.tx_debug_snapshot();
                 let mut outcome = StepOutcome::Idle;
-                if self.node.tx_debug_snapshot() != tx_before || event.is_some() {
+                if tx_after != tx_before || event.is_some() {
                     outcome = StepOutcome::RadioActivity;
+                }
+                if self.role == Role::Anchor
+                    && self.anchor_is_coordinator
+                    && tx_after.0 != tx_before.0
+                    && tx_after.1 == Some(FrameKind::ScheduleSync)
+                {
+                    self.schedule_sync_tx_count = self.schedule_sync_tx_count.wrapping_add(1);
                 }
                 if self.handle_event(event, now) {
                     outcome = StepOutcome::RangeUpdated;
@@ -149,17 +191,27 @@ impl<const N: usize> RangingApp<N> {
                 self.record_outcome(now, outcome);
                 self.log_anchor_heartbeat(now);
             }
+            Err(Error::DelayedSendTooLate) => {
+                // The driver aborted the send and re-armed receive; the next
+                // tick retries without a full radio recovery.
+                warn!("delayed send scheduled too late");
+                self.record_outcome(now, StepOutcome::RadioActivity);
+            }
             Err(_) => self.recover(RecoverReason::new(now, "tick failed")).await,
         }
     }
 
     async fn handle_irq(
         &mut self,
-        irq_result: Result<(), Error<impl embedded_hal::spi::Error, impl embedded_hal::digital::Error>>,
+        irq_result: Result<
+            (),
+            Error<impl embedded_hal::spi::Error, impl embedded_hal::digital::Error>,
+        >,
         now: u32,
     ) {
         if irq_result.is_err() {
-            self.recover(RecoverReason::new(now, "irq wait failed")).await;
+            self.recover(RecoverReason::new(now, "irq wait failed"))
+                .await;
             return;
         }
 
@@ -193,6 +245,7 @@ impl<const N: usize> RangingApp<N> {
             }
 
             if has_rx_work(irq_status) {
+                self.rx_event_count = self.rx_event_count.wrapping_add(1);
                 match self
                     .node
                     .on_rx_async(&mut self.board.radio, now, &mut self.rx_buffer)
@@ -204,13 +257,19 @@ impl<const N: usize> RangingApp<N> {
                             outcome = StepOutcome::RangeUpdated;
                         }
                     }
-                    Err(Error::Receive(_)) => {
+                    Err(Error::Receive(error)) => {
                         outcome = outcome.merge(StepOutcome::RadioActivity);
-                        warn!("rx error");
+                        warn!("rx error: {=str}", rx_error_label(error));
                     }
                     Err(Error::Protocol(_)) => {
                         outcome = outcome.merge(StepOutcome::RadioActivity);
                         warn!("protocol error");
+                    }
+                    Err(Error::DelayedSendTooLate) => {
+                        // The driver aborted the reply and re-armed receive;
+                        // the exchange timeout takes care of the retry.
+                        outcome = outcome.merge(StepOutcome::RadioActivity);
+                        warn!("delayed reply scheduled too late");
                     }
                     Err(_) => return Err(RecoverReason::new(now, "rx handling failed")),
                 }
@@ -234,7 +293,12 @@ impl<const N: usize> RangingApp<N> {
 
     async fn recover(&mut self, reason: RecoverReason) {
         self.board
-            .recover_or_fault(&mut self.node, &self.radio_config, reason.now_ms, reason.message)
+            .recover_or_fault(
+                &mut self.node,
+                &self.radio_config,
+                reason.now_ms,
+                reason.message,
+            )
             .await;
         self.last_radio_activity_ms = reason.now_ms;
         self.last_range_update_ms = reason.now_ms;
@@ -250,8 +314,7 @@ impl<const N: usize> RangingApp<N> {
         {
             warn!(
                 "recovering link radio_gap={=u32} range_gap={=u32}",
-                radio_gap_ms,
-                range_gap_ms
+                radio_gap_ms, range_gap_ms
             );
             self.recover(RecoverReason::new(now, "stalled link")).await;
         }
@@ -283,11 +346,13 @@ impl<const N: usize> RangingApp<N> {
             .map(|last_sync| now.wrapping_sub(last_sync))
             .unwrap_or(u32::MAX);
         info!(
-            "anchor alive short={=u16} coordinator={=bool} sync_count={=u32} sync_age_ms={=u32}",
+            "anchor alive short={=u16} coordinator={=bool} sync_tx={=u32} sync_rx={=u32} sync_age_ms={=u32} rx_events={=u32}",
             self.identity.short_address.raw(),
             self.anchor_is_coordinator,
+            self.schedule_sync_tx_count,
             self.schedule_sync_count,
-            sync_age_ms
+            sync_age_ms,
+            self.rx_event_count
         );
     }
 
@@ -346,6 +411,10 @@ impl<const N: usize> RangingApp<N> {
                 }
                 false
             }
+            Some(RangingEvent::ExchangeTimedOut) => {
+                warn!("{=str} ranging exchange timed out", role_label(self.role));
+                false
+            }
             None => false,
         }
     }
@@ -369,16 +438,18 @@ fn default_radio_config(identity: DeviceIdentity, antenna_delay: AntennaDelay) -
     config
 }
 
-fn default_ranging_config(
-    identity: DeviceIdentity,
-    schedule: RangingSchedule,
-    anchor_is_coordinator: bool,
-) -> RangingConfig {
-    let mut config = RangingConfig::new(identity);
+fn default_ranging_config(node_config: &NodeConfig) -> RangingConfig {
+    let mut config = RangingConfig::new(node_config.identity);
     config.reply_delay_us = RANGING_REPLY_DELAY_US;
+    config.discovery_reply_delay_us = node_config.discovery_reply_delay_us;
+    config.exchange_timeout_ms = RANGING_EXCHANGE_TIMEOUT_MS;
     config.reset_period_ms = PEER_INACTIVITY_TIMEOUT_MS;
-    config.schedule = schedule;
-    config.anchor_is_coordinator = anchor_is_coordinator;
+    config.schedule.tag_slot = node_config.tag_slot;
+    config.schedule.tag_slot_count = TAG_SLOT_COUNT;
+    config.schedule.tag_slot_ms = TAG_SLOT_MS;
+    config.schedule.session_timeout_ms = RANGING_SESSION_TIMEOUT_MS;
+    config.schedule.range_period_ms = RANGING_PERIOD_MS;
+    config.anchor_is_coordinator = node_config.anchor_is_coordinator;
     config
 }
 
@@ -394,11 +465,20 @@ fn role_label(role: Role) -> &'static str {
 }
 
 fn has_rx_work(irq_status: SysStatus) -> bool {
-    irq_status.contains(status::RX_FRAME_READY)
-        || irq_status.contains(status::RX_FRAME_GOOD)
-        || irq_status.contains(status::RX_FRAME_CHECK_ERROR)
-        || irq_status.contains(status::RX_REED_SOLOMON_ERROR)
-        || irq_status.contains(status::RX_TIMEOUT)
-        || irq_status.contains(status::RX_HEADER_ERROR)
-        || irq_status.contains(status::LDE_ERROR)
+    irq_status.intersects(RX_WORK_EVENTS)
+}
+
+fn rx_error_label(error: RxError) -> &'static str {
+    match error {
+        RxError::FrameNotReady => "frame not ready",
+        RxError::LeadingEdgeDetection => "leading edge detection",
+        RxError::FrameCheck => "frame check",
+        RxError::Header => "phy header",
+        RxError::ReedSolomon => "reed solomon",
+        RxError::Timeout => "frame timeout",
+        RxError::SfdTimeout => "sfd timeout",
+        RxError::PreambleTimeout => "preamble timeout",
+        RxError::Overrun => "overrun",
+        RxError::FrameFiltered => "frame filtered",
+    }
 }

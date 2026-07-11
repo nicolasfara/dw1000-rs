@@ -217,7 +217,13 @@ pub struct Peer {
     /// Most recent inbound sequence number accepted from this peer.
     pub last_sequence: Option<u8>,
     /// Reply delay selected for this peer.
-    pub reply_delay_us: u32,
+    pub reply_delay_us: u16,
+    /// Anchor-side flag: a poll from this peer was acknowledged and the
+    /// matching range frame has not arrived yet.
+    pub awaiting_range: bool,
+    /// Host timestamp of the poll behind `awaiting_range`, used to expire
+    /// stale exchanges instead of mixing timestamps across exchanges.
+    pub poll_received_ms: u32,
     /// Ranging timestamps.
     pub poll_sent: DwTime,
     /// Ranging timestamps.
@@ -245,6 +251,8 @@ impl Peer {
             last_activity_ms: 0,
             last_sequence: None,
             reply_delay_us: 0,
+            awaiting_range: false,
+            poll_received_ms: 0,
             poll_sent: DwTime::zero(),
             poll_received: DwTime::zero(),
             poll_ack_sent: DwTime::zero(),

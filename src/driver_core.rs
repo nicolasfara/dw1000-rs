@@ -37,6 +37,8 @@ pub(crate) const SYS_STATUS_HI_SUB: u16 = 0x03;
 pub(crate) const DELAYED_TX_LATE_MASK: u16 = 0x0408;
 /// HPDWARN in the byte at SYS_STATUS offset 3.
 pub(crate) const HPDWARN_HI_BIT: u8 = 0x08;
+/// TXFRS in the lowest SYS_STATUS byte.
+pub(crate) const TXFRS_LOW_BIT: u8 = (status::TX_FRAME_SENT.0 & 0xFF) as u8;
 /// PMSC SOFTRESET value that holds the receiver in reset.
 pub(crate) const PMSC_SOFTRESET_RX: u8 = 0xE0;
 /// PMSC SOFTRESET value that releases all reset lines.
@@ -229,6 +231,21 @@ impl DriverRuntime {
             DriverState::Rx => (event_mask.0 & RECEIVE_RESTART_EVENTS) != 0,
             DriverState::Idle => false,
         }
+    }
+
+    /// In single-buffered mode RXAUTR does not resume reception after a
+    /// successfully received frame. Keep a permanent receive session alive
+    /// by explicitly re-arming it after the host has consumed that frame.
+    ///
+    /// A reply scheduled while processing the frame moves the runtime to TX,
+    /// so it is deliberately excluded here. Its TX-done path re-arms RX
+    /// through [`Self::should_restart_receive`] instead.
+    pub(crate) const fn should_rearm_after_good_receive(&self, event_mask: SysStatus) -> bool {
+        self.permanent_receive
+            && matches!(self.state, DriverState::Rx)
+            && event_mask.intersects(SysStatus(
+                status::RX_FRAME_READY.0 | status::RX_FRAME_GOOD.0,
+            ))
     }
 
     pub(crate) fn checked_frame_len(&self, payload_len: usize) -> Result<usize, (usize, usize)> {

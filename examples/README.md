@@ -4,8 +4,8 @@ The example firmware now lives in `examples/embassy-stm32l432`.
 
 It contains one shared Embassy-based STM32L432 application with two binaries:
 
-- `bin/anchor.rs`: anchor node that participates in discovery and responds to ranging
-- `bin/tag.rs`: tag node that initiates ranging and logs the measured distance to the anchor
+- `bin/anchor.rs`: anchor node selected entirely by compile-time configuration
+- `bin/tag.rs`: tag node that initiates ranging and logs the measured distance to every discovered anchor
 
 ## Target Hardware
 
@@ -53,51 +53,66 @@ Use `--release` for flashing/running. The `dev` profile does not fit in the STM3
 ## Defaults
 
 - PAN ID: `0x0D57`
-- Anchor short addresses: `3344..3347`
-- Tag short addresses: `3400..3401`
+- Tag short address: `3345`
+- Default anchor short address: `3344`
 - Antenna delay start value: `16_456`
 - Operating mode: `OperatingMode::LongDataRangeAccuracy`
-- Discovery response slot spacing: `12_000 us`
+- Maximum discovered anchors: `4`
+- Base reply delay: `7 ms`; poll acknowledgements and range reports use staggered anchor reply slots assigned in the broadcast poll (`7`, `21`, `35`, `49 ms`)
+- Discovery replies are staggered per anchor: the default slot is derived from the anchor short address (`7 ms * (1 + short % 8)`), so anchors that only differ by `DW1000_ANCHOR_SHORT` never answer the same blink in the same slot
+- The tag uses an `80 ms` collection window per phase and ranges the anchors that acknowledged the poll even if another anchor missed its reply
 
-Anchor and tag identity can be overridden at compile time with environment variables. Flash four anchors with distinct `DW1000_ANCHOR_SLOT` values and two tags with distinct `DW1000_TAG_SLOT` values:
+Both binaries are configured at build time:
 
-```bash
-DW1000_ANCHOR_SHORT=3344 \
-DW1000_ANCHOR_EUI=B14A7C0011223344 \
-DW1000_ANCHOR_SLOT=0 \
-DW1000_ANCHOR_COORDINATOR=1 \
-cargo run --release --bin anchor
+| Variable | Applies to | Default |
+| --- | --- | --- |
+| `DW1000_ANCHOR_PAN_ID` / `DW1000_TAG_PAN_ID` | anchor / tag | `0x0D57` |
+| `DW1000_ANCHOR_SHORT` / `DW1000_TAG_SHORT` | anchor / tag | `3344` / `3345` |
+| `DW1000_ANCHOR_EUI` / `DW1000_TAG_EUI` | anchor / tag | fixed example EUIs |
+| `DW1000_ANCHOR_ANTENNA_DELAY` / `DW1000_TAG_ANTENNA_DELAY` | anchor / tag | `16_456` |
+| `DW1000_ANCHOR_DISCOVERY_REPLY_DELAY_US` | anchor | `7 ms * (1 + short % 8)` |
+| `DW1000_ANCHOR_COORDINATOR` | anchor | `false` |
+| `DW1000_TAG_SLOT` | tag | `0` |
+| `DW1000_TAG_SLOT_COUNT` | every node | `1` |
+| `DW1000_TAG_SLOT_MS` | every node | `250` |
 
-DW1000_ANCHOR_SHORT=3345 \
-DW1000_ANCHOR_EUI=B14A7C0011223345 \
-DW1000_ANCHOR_SLOT=1 \
-cargo run --release --bin anchor
+## Single tag, multiple anchors
 
-DW1000_TAG_SHORT=3400 \
-DW1000_TAG_EUI=82175BD5A99AE29C \
-DW1000_TAG_SLOT=0 \
-cargo run --release --bin tag
-
-DW1000_TAG_SHORT=3401 \
-DW1000_TAG_EUI=82175BD5A99AE29D \
-DW1000_TAG_SLOT=1 \
-cargo run --release --bin tag
-```
-
-`DW1000_ANCHOR_SHORT`, `DW1000_TAG_SHORT`, and PAN IDs accept decimal or `0x` hexadecimal. EUI variables accept 16 hex digits with optional `:`, `-`, `_`, or space separators. Shared schedule knobs are `DW1000_TAG_SLOT_COUNT`, `DW1000_TAG_SLOT_MS`, `DW1000_DISCOVERY_SLOT_SPACING_US`, `DW1000_SESSION_TIMEOUT_MS`, and `DW1000_RANGE_PERIOD_MS`.
-
-Tags log structured range measurements:
-
-```text
-uwb_range tag=3400 anchor=3344 range_m=1.234 quality=1.500
-```
-
-The host dashboard lives in `tools/uwb-dashboard`:
+No coordinator or master anchor is required: the tag schedules the whole exchange itself through the broadcast poll. Flash each anchor with a unique short address and EUI-64 (the discovery reply slot follows automatically), then flash the tag with its defaults:
 
 ```bash
-cargo run --manifest-path tools/uwb-dashboard/Cargo.toml -- --config tools/uwb-dashboard/anchors.toml --bind 127.0.0.1:8080
+DW1000_ANCHOR_SHORT=3344 DW1000_ANCHOR_EUI=B14A7C0011223344 cargo run --release --bin anchor
+DW1000_ANCHOR_SHORT=3346 DW1000_ANCHOR_EUI=B14A7C0011223345 cargo run --release --bin anchor
+DW1000_ANCHOR_SHORT=3347 DW1000_ANCHOR_EUI=B14A7C0011223346 cargo run --release --bin anchor
+DW1000_ANCHOR_SHORT=3348 DW1000_ANCHOR_EUI=B14A7C0011223347 cargo run --release --bin anchor
+cargo run --release --bin tag
 ```
 
-It accepts range samples with `POST /api/ranges`, exposes `GET /api/state`, and broadcasts state updates on `GET /ws`.
+## Multiple tags on the same PAN
 
-Tune the antenna delay constants in the two binaries against a known fixed distance on real hardware.
+Several tags share the air time through a TDMA frame of `DW1000_TAG_SLOT_COUNT` slots of `DW1000_TAG_SLOT_MS` each. The slot boundaries come from one coordinator anchor, so this setup requires all of the following:
+
+- `DW1000_TAG_SLOT_COUNT` (and `DW1000_TAG_SLOT_MS`, if overridden) set to the same value on **every** node, anchors included
+- exactly one anchor built with `DW1000_ANCHOR_COORDINATOR=1`
+- a unique `DW1000_TAG_SLOT` (from `0` to `count - 1`), short address, and EUI-64 per tag
+
+Example with two tags and four anchors:
+
+```bash
+DW1000_TAG_SLOT_COUNT=2 DW1000_ANCHOR_SHORT=3344 DW1000_ANCHOR_EUI=B14A7C0011223344 DW1000_ANCHOR_COORDINATOR=1 cargo run --release --bin anchor
+DW1000_TAG_SLOT_COUNT=2 DW1000_ANCHOR_SHORT=3346 DW1000_ANCHOR_EUI=B14A7C0011223345 cargo run --release --bin anchor
+DW1000_TAG_SLOT_COUNT=2 DW1000_ANCHOR_SHORT=3347 DW1000_ANCHOR_EUI=B14A7C0011223346 cargo run --release --bin anchor
+DW1000_TAG_SLOT_COUNT=2 DW1000_ANCHOR_SHORT=3348 DW1000_ANCHOR_EUI=B14A7C0011223347 cargo run --release --bin anchor
+
+DW1000_TAG_SLOT_COUNT=2 DW1000_TAG_SLOT=0 DW1000_TAG_SHORT=3345 DW1000_TAG_EUI=82175BD5A99AE29C cargo run --release --bin tag
+DW1000_TAG_SLOT_COUNT=2 DW1000_TAG_SLOT=1 DW1000_TAG_SHORT=3350 DW1000_TAG_EUI=82175BD5A99AE29D cargo run --release --bin tag
+```
+
+How the multi-tag schedule behaves:
+
+- tags stay **silent until they hear the coordinator's schedule broadcast** (within one or two `250 ms` sync periods), so an unsynced tag never tramples another tag's exchange — if a tag with `DW1000_TAG_SLOT_COUNT > 1` never transmits, check that a coordinator anchor is running
+- a tag only starts an exchange when enough of its slot remains for both collection phases, so exchanges cannot spill into the next slot
+- anchors keep per-tag exchange state, so overlapping exchanges from different tags at a slot boundary still complete instead of resetting each other
+- each tag ranges all anchors once per TDMA frame (`count * slot_ms`, i.e. every `500 ms` in the example above)
+
+Keep the PAN ID shared, but assign every physical tag and anchor a unique short address and EUI-64. Avoid anchor short addresses that are congruent modulo 8 (they would share a discovery slot — set `DW1000_ANCHOR_DISCOVERY_REPLY_DELAY_US` explicitly in that case). Tune each node's antenna delay against a known fixed distance on real hardware.
