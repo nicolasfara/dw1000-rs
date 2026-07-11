@@ -7,7 +7,7 @@
 use defmt::Format;
 
 use crate::device::{AntennaDelay, DeviceIdentity};
-use crate::time::DwTime;
+use crate::time::DelayedTime;
 
 /// Data transmission/reception bit rate
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,16 +130,6 @@ impl PreambleCode {
     }
 }
 
-/// Frame length mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(Format))]
-pub enum FrameLength {
-    /// Normal frame length (up to 127 bytes)
-    Normal = 0x00,
-    /// Extended frame length (up to 1023 bytes)
-    Extended = 0x03,
-}
-
 /// Pre-defined operation modes combining data rate, PRF, and preamble length
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(Format))]
@@ -193,189 +183,6 @@ impl OperatingMode {
                 PreambleLength::Symbols2048,
             ),
         }
-    }
-}
-
-/// Clock selection for the DW1000
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(Format))]
-pub enum ClockMode {
-    /// Automatic clock selection
-    Auto = 0x00,
-    /// External crystal oscillator
-    Xti = 0x01,
-    /// PLL clock
-    Pll = 0x02,
-}
-impl ClockMode {
-    /// Converts a u8 to ClockMode, defaulting to Auto for invalid values
-    pub fn from_u8(value: u8) -> Self {
-        match value {
-            0x01 => ClockMode::Xti,
-            0x02 => ClockMode::Pll,
-            _ => ClockMode::Auto,
-        }
-    }
-
-    /// Converts ClockMode to u8
-    pub fn to_u8(&self) -> u8 {
-        *self as u8
-    }
-}
-
-/// Range bias correction tables for different configurations
-pub struct RangeBias;
-
-impl RangeBias {
-    /// Range bias zero offset for 500 MHz band, 16 MHz PRF
-    pub const BIAS_500_16_ZERO: usize = 10;
-    /// Range bias zero offset for 500 MHz band, 64 MHz PRF
-    pub const BIAS_500_64_ZERO: usize = 8;
-    /// Range bias zero offset for 900 MHz band, 16 MHz PRF
-    pub const BIAS_900_16_ZERO: usize = 7;
-    /// Range bias zero offset for 900 MHz band, 64 MHz PRF
-    pub const BIAS_900_64_ZERO: usize = 7;
-
-    /// Range bias table for 500 MHz band, 16 MHz PRF (in mm, -61 to -95 dBm)
-    pub const BIAS_500_16: [u8; 18] = [
-        198, 187, 179, 163, 143, 127, 109, 84, 59, 31, 0, 36, 65, 84, 97, 106, 110, 112,
-    ];
-
-    /// Range bias table for 500 MHz band, 64 MHz PRF (in mm, -61 to -95 dBm)
-    pub const BIAS_500_64: [u8; 18] = [
-        110, 105, 100, 93, 82, 69, 51, 27, 0, 21, 35, 42, 49, 62, 71, 76, 81, 86,
-    ];
-
-    /// Range bias table for 900 MHz band, 16 MHz PRF (in 2mm units, -61 to -95 dBm)
-    pub const BIAS_900_16: [u8; 18] = [
-        137, 122, 105, 88, 69, 47, 25, 0, 21, 48, 79, 105, 127, 147, 160, 169, 178, 197,
-    ];
-
-    /// Range bias table for 900 MHz band, 64 MHz PRF (in 2mm units, -61 to -95 dBm)
-    pub const BIAS_900_64: [u8; 18] = [
-        147, 133, 117, 99, 75, 50, 29, 0, 24, 45, 63, 76, 87, 98, 116, 122, 132, 142,
-    ];
-}
-
-/// Configuration builder for the DW1000
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(Format))]
-pub struct DW1000Configuration {
-    /// Data transmission rate
-    pub data_rate: DataRate,
-    /// Pulse repetition frequency
-    pub pulse_frequency: PulseFrequency,
-    /// Preamble length
-    pub preamble_length: PreambleLength,
-    /// RF channel
-    pub channel: Channel,
-    /// Preamble code
-    pub preamble_code: PreambleCode,
-    /// PAC size
-    pub pac_size: PacSize,
-    /// Frame length mode
-    pub frame_length: FrameLength,
-    /// Smart power control
-    pub smart_power: bool,
-    /// Suppress frame check sequence
-    pub suppress_frame_check: bool,
-    /// Receiver auto re-enable
-    pub receiver_auto_reenable: bool,
-    /// Interrupt polarity (true = active high)
-    pub interrupt_polarity: bool,
-}
-
-impl Default for DW1000Configuration {
-    fn default() -> Self {
-        // Default is LongDataRangeLowPower mode
-        let (data_rate, pulse_frequency, preamble_length) =
-            OperatingMode::LongDataRangeLowPower.config();
-
-        Self {
-            data_rate,
-            pulse_frequency,
-            preamble_length,
-            channel: Channel::Channel5,
-            preamble_code: PreambleCode::Code4,
-            pac_size: PacSize::Symbols8,
-            frame_length: FrameLength::Normal,
-            smart_power: false,
-            receiver_auto_reenable: true,
-            suppress_frame_check: false,
-            interrupt_polarity: true,
-        }
-    }
-}
-
-impl DW1000Configuration {
-    /// Creates a new configuration with default settings
-    pub const fn new() -> Self {
-        Self {
-            data_rate: DataRate::Kbps110,
-            pulse_frequency: PulseFrequency::Mhz16,
-            preamble_length: PreambleLength::Symbols2048,
-            channel: Channel::Channel5,
-            preamble_code: PreambleCode::Code4,
-            pac_size: PacSize::Symbols8,
-            frame_length: FrameLength::Normal,
-            smart_power: false,
-            receiver_auto_reenable: true,
-            suppress_frame_check: false,
-            interrupt_polarity: true,
-        }
-    }
-
-    /// Creates a configuration from an operating mode
-    pub fn from_mode(mode: OperatingMode) -> Self {
-        let (data_rate, pulse_frequency, preamble_length) = mode.config();
-        Self {
-            data_rate,
-            pulse_frequency,
-            preamble_length,
-            ..Default::default()
-        }
-    }
-
-    /// Sets the data rate
-    pub const fn with_data_rate(mut self, rate: DataRate) -> Self {
-        self.data_rate = rate;
-        self
-    }
-
-    /// Sets the pulse frequency
-    pub const fn with_pulse_frequency(mut self, freq: PulseFrequency) -> Self {
-        self.pulse_frequency = freq;
-        self
-    }
-
-    /// Sets the preamble length
-    pub const fn with_preamble_length(mut self, length: PreambleLength) -> Self {
-        self.preamble_length = length;
-        self
-    }
-
-    /// Sets the channel
-    pub const fn with_channel(mut self, channel: Channel) -> Self {
-        self.channel = channel;
-        self
-    }
-
-    /// Sets the preamble code
-    pub const fn with_preamble_code(mut self, code: PreambleCode) -> Self {
-        self.preamble_code = code;
-        self
-    }
-
-    /// Sets smart power control
-    pub const fn with_smart_power(mut self, enabled: bool) -> Self {
-        self.smart_power = enabled;
-        self
-    }
-
-    /// Sets receiver auto re-enable
-    pub const fn with_receiver_auto_reenable(mut self, enabled: bool) -> Self {
-        self.receiver_auto_reenable = enabled;
-        self
     }
 }
 
@@ -505,8 +312,8 @@ impl RadioConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "defmt", derive(Format))]
 pub struct RxOptions {
-    /// Optional delayed start time relative to the current system timestamp.
-    pub delayed_time: Option<DwTime>,
+    /// Optional absolute delayed start time, obtained from `schedule_delayed`.
+    pub delayed_time: Option<DelayedTime>,
     /// Keep the receiver permanently armed.
     pub permanent: bool,
 }
@@ -515,8 +322,8 @@ pub struct RxOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "defmt", derive(Format))]
 pub struct TxOptions {
-    /// Optional delayed transmit time relative to the current system timestamp.
-    pub delayed_time: Option<DwTime>,
+    /// Optional absolute delayed transmit time, obtained from `schedule_delayed`.
+    pub delayed_time: Option<DelayedTime>,
     /// Set the WAIT4RESP bit after transmit.
     pub wait_for_response: bool,
 }

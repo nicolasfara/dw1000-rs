@@ -337,7 +337,7 @@ pub fn encode_ranging_init(
     Ok(RANGING_INIT_LEN)
 }
 
-/// Encodes a schedule-sync frame.
+/// Encodes a coordinator schedule-sync frame.
 pub fn encode_schedule_sync(
     sequence: u8,
     source: ShortAddress,

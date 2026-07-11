@@ -19,8 +19,16 @@ pub enum RxError {
     Header,
     /// Reed-Solomon decoder error.
     ReedSolomon,
-    /// Receive timeout.
+    /// Receive frame wait timeout.
     Timeout,
+    /// SFD detection timeout.
+    SfdTimeout,
+    /// Preamble detection timeout.
+    PreambleTimeout,
+    /// Receiver overrun.
+    Overrun,
+    /// Frame rejected by the automatic frame filter.
+    FrameFiltered,
 }
 
 /// Protocol-level decoding and state-machine errors.
@@ -55,7 +63,15 @@ pub enum Error<SpiE, PinE> {
     Protocol(ProtocolError),
     /// Invalid configuration supplied to the driver.
     InvalidConfig(ConfigError),
-    /// The driver operation requires a completed radio configuration.
+    /// The device did not report the expected DW1000 `DEV_ID` (0xDECA0130).
+    InvalidDeviceId(u32),
+    /// A delayed transmission was scheduled after the programmed time passed;
+    /// the transceiver was forced off instead of stalling until timer wrap.
+    DelayedSendTooLate,
+    /// A delayed receive was scheduled after the programmed time passed; the
+    /// receiver was re-enabled immediately instead.
+    DelayedReceiveTooLate,
+    /// The driver has not been configured yet.
     NotConfigured,
     /// Caller-provided buffer was too small.
     BufferTooSmall {

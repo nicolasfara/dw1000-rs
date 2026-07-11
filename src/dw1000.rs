@@ -4,32 +4,28 @@ use embedded_hal::delay::DelayNs;
 use embedded_hal::digital::{InputPin, OutputPin};
 use embedded_hal::spi::{Operation, SpiDevice};
 
-use crate::config::{RadioConfig, RxOptions, TxOptions, ValidatedPhyConfig};
-use crate::constants::{GPIO_MODE_SUB, LEN_GPIO_MODE};
+use crate::config::{RadioConfig, RxOptions, TxOptions};
 use crate::device::{DeviceIdentity, RxFrame, SignalMetrics, SysStatus, Timestamps};
 use crate::driver_core::{
     apply_clock_mode, build_header, cleared_interrupt_mask, compose_base_register_fields,
     compose_gpio_led_mode, compose_led_blink_enable, compose_led_clock_enable,
     compose_phy_register_fields, compose_receive_sys_ctrl, compose_transmit_sys_ctrl,
-    compute_first_path_power, compute_receive_power, compute_receive_quality,
-    extract_preamble_acc_count, header_len, prepare_idle_state, receive_status_clear_mask,
-    select_tuning_values, set_lde_load_preamble, set_lde_restore_preamble,
-    transmit_status_clear_mask, ClockMode, DriverRuntime,
+    config_register_writes, fs_xtalt_value, header_len, parse_rx_snapshot, prepare_idle_state,
+    receive_status_clear_mask, select_tuning_values, set_lde_load_preamble,
+    set_lde_restore_preamble, transmit_status_clear_mask, ClockMode, DriverRuntime,
+    DELAYED_TX_LATE_MASK, HPDWARN_HI_BIT, OTP_ADDRESS_LDOTUNE, OTP_ADDRESS_XTAL_TRIM,
+    OTP_SF_LDO_KICK, PMSC_SOFTRESET_CLEAR, PMSC_SOFTRESET_RX, SYS_STATUS_HI_SUB, TXFRS_LOW_BIT,
 };
-use crate::error::Error;
+use crate::error::{Error, RxError};
 use crate::registers::{
-    sys_status_from_bytes, sys_status_to_bytes, Register, AGC_TUNE1_SUB, AGC_TUNE2_SUB,
-    AGC_TUNE3_SUB, CIR_PWR_SUB, DRX_TUNE0B_SUB, DRX_TUNE1A_SUB, DRX_TUNE1B_SUB, DRX_TUNE2_SUB,
-    DRX_TUNE4H_SUB, FP_AMPL1_SUB, FP_AMPL2_SUB, FP_AMPL3_SUB, FS_PLLCFG_SUB, FS_PLLTUNE_SUB,
-    FS_XTALT_SUB, LDE_CFG1_SUB, LDE_CFG2_SUB, LDE_REPC_SUB, LDE_RXANTD_SUB, LEN_CHAN_CTRL,
-    LEN_CIR_PWR, LEN_FP_AMPL1, LEN_FP_AMPL2, LEN_FP_AMPL3, LEN_LDE_RXANTD, LEN_OTP_ADDR,
-    LEN_OTP_CTRL, LEN_OTP_RDAT, LEN_PANADR, LEN_PMSC_CTRL0, LEN_PMSC_LEDC, LEN_RX_FINFO,
-    LEN_RX_STAMP, LEN_STD_NOISE, LEN_SYS_CFG, LEN_SYS_CTRL, LEN_SYS_MASK, LEN_SYS_STATUS,
-    LEN_TX_ANTD, LEN_TX_FCTRL, LEN_TX_STAMP, NO_SUBADDRESS, OTP_ADDR_SUB, OTP_CTRL_SUB,
-    OTP_RDAT_SUB, PMSC_CTRL0_SUB, PMSC_LEDC_SUB, RF_RXCTRLH_SUB, RF_TXCTRL_SUB, RX_STAMP_SUB,
-    SFD_LENGTH_SUB, STD_NOISE_SUB, TC_PGDELAY_SUB, TX_STAMP_SUB,
+    sys_status_from_bytes, sys_status_to_bytes, Register, EXPECTED_DEVICE_ID, GPIO_MODE_SUB,
+    LEN_CHAN_CTRL, LEN_DEV_ID, LEN_GPIO_MODE, LEN_OTP_ADDR, LEN_OTP_CTRL, LEN_OTP_RDAT,
+    LEN_PMSC_CTRL0, LEN_PMSC_LEDC, LEN_RX_FINFO, LEN_RX_FQUAL, LEN_RX_STAMP, LEN_RX_TIME,
+    LEN_SYS_CFG, LEN_SYS_CTRL, LEN_SYS_MASK, LEN_SYS_STATUS, LEN_TX_FCTRL, LEN_TX_STAMP,
+    NO_SUBADDRESS, OTP_ADDR_SUB, OTP_CTRL_SUB, OTP_RDAT_SUB, OTP_SF_SUB, PMSC_CTRL0_SUB,
+    PMSC_LEDC_SUB, PMSC_SOFTRESET_SUB, RX_STAMP_SUB, TX_STAMP_SUB,
 };
-use crate::time::DwTime;
+use crate::time::{DelayedTime, DwTime};
 
 /// Blocking DW1000 driver.
 #[derive(Debug)]
@@ -37,12 +33,8 @@ pub struct Dw1000<SPI, IRQ, RST> {
     spi: SPI,
     irq: IRQ,
     reset: RST,
-    sys_cfg: [u8; LEN_SYS_CFG],
     sys_ctrl: [u8; LEN_SYS_CTRL],
-    sys_mask: [u8; LEN_SYS_MASK],
     tx_fctrl: [u8; LEN_TX_FCTRL],
-    chan_ctrl: [u8; LEN_CHAN_CTRL],
-    panadr: [u8; LEN_PANADR],
     runtime: DriverRuntime,
 }
 
@@ -58,12 +50,8 @@ where
             spi,
             irq,
             reset,
-            sys_cfg: [0; LEN_SYS_CFG],
             sys_ctrl: [0; LEN_SYS_CTRL],
-            sys_mask: [0; LEN_SYS_MASK],
             tx_fctrl: [0; LEN_TX_FCTRL],
-            chan_ctrl: [0; LEN_CHAN_CTRL],
-            panadr: [0xFF; LEN_PANADR],
             runtime: DriverRuntime::new(),
         }
     }
@@ -75,11 +63,13 @@ where
         config: &RadioConfig,
     ) -> Result<(), Error<SPI::Error, PinE>> {
         self.hard_reset(delay)?;
-        self.enable_clock(ClockMode::Auto)?;
-        delay.delay_ms(5);
-        self.clear_interrupts()?;
+        self.verify_device_id()?;
+        // OTP reads and the LDE microcode load require the XTI system clock.
         self.enable_clock(ClockMode::Xti)?;
         delay.delay_ms(5);
+        self.clear_interrupts()?;
+        self.kick_ldo_tune()?;
+        self.runtime.xtal_trim = Some(self.read_otp(OTP_ADDRESS_XTAL_TRIM)?[0]);
         self.manage_lde(delay)?;
         self.enable_clock(ClockMode::Auto)?;
         delay.delay_ms(5);
@@ -89,44 +79,44 @@ where
     /// Applies a new radio configuration without performing a reset.
     pub fn reconfigure(&mut self, config: &RadioConfig) -> Result<(), Error<SPI::Error, PinE>> {
         let phy = self.runtime.reconfigure(config)?;
+        let tuning = select_tuning_values(phy).map_err(Error::InvalidConfig)?;
 
         self.idle()?;
-        self.panadr = [0xFF; LEN_PANADR];
-        self.panadr[0..2].copy_from_slice(&config.address.identity.short_address.to_le_bytes());
-        self.panadr[2..4].copy_from_slice(&config.address.identity.pan_id.to_le_bytes());
-        self.sys_cfg = [0; LEN_SYS_CFG];
-        self.sys_mask = [0; LEN_SYS_MASK];
-        self.tx_fctrl = [0; LEN_TX_FCTRL];
-        self.chan_ctrl = [0; LEN_CHAN_CTRL];
 
+        let mut sys_cfg = [0u8; LEN_SYS_CFG];
+        let mut sys_mask = [0u8; LEN_SYS_MASK];
+        let mut chan_ctrl = [0u8; LEN_CHAN_CTRL];
+        self.tx_fctrl = [0; LEN_TX_FCTRL];
         compose_base_register_fields(
-            &mut self.sys_cfg,
-            &mut self.sys_mask,
+            &mut sys_cfg,
+            &mut sys_mask,
             config.interrupt_polarity_high,
             config.receiver_auto_reenable,
             phy.smart_power,
         );
+        let sfd_len =
+            compose_phy_register_fields(&mut sys_cfg, &mut self.tx_fctrl, &mut chan_ctrl, phy);
 
-        self.apply_phy_config(phy)?;
-        let panadr = self.panadr;
-        self.write_register(Register::PanAdr, NO_SUBADDRESS, &panadr)?;
-        self.write_register(
-            Register::Eui,
-            NO_SUBADDRESS,
-            &config.address.identity.eui.to_register_bytes(),
-        )?;
-        let sys_cfg = self.sys_cfg;
-        let sys_mask = self.sys_mask;
-        let chan_ctrl = self.chan_ctrl;
+        let xtal_trim = match self.runtime.xtal_trim {
+            Some(trim) => trim,
+            None => self.read_otp(OTP_ADDRESS_XTAL_TRIM)?[0],
+        };
+
         let tx_fctrl = self.tx_fctrl;
-        self.write_register(Register::SysCfg, NO_SUBADDRESS, &sys_cfg)?;
-        self.write_register(Register::SysMask, NO_SUBADDRESS, &sys_mask)?;
-        self.write_register(Register::ChanCtrl, NO_SUBADDRESS, &chan_ctrl)?;
-        self.write_register(Register::TxFctrl, NO_SUBADDRESS, &tx_fctrl)?;
-        self.apply_tuning(phy)?;
-        let antenna = self.runtime.antenna_delay.to_time_bytes();
-        self.write_register(Register::TxAntd, NO_SUBADDRESS, &antenna[..LEN_TX_ANTD])?;
-        self.write_register(Register::LdeIf, LDE_RXANTD_SUB, &antenna[..LEN_LDE_RXANTD])?;
+        let writes = config_register_writes(
+            &config.address.identity,
+            &sys_cfg,
+            &sys_mask,
+            &chan_ctrl,
+            &tx_fctrl,
+            sfd_len,
+            &tuning,
+            self.runtime.antenna_delay,
+            fs_xtalt_value(xtal_trim),
+        );
+        for write in &writes {
+            self.write_register(write.register, write.subaddress, write.data())?;
+        }
         Ok(())
     }
 
@@ -136,9 +126,12 @@ where
         self.clear_receive_status()?;
         self.sys_ctrl = [0; LEN_SYS_CTRL];
         self.runtime.begin_receive_session(options.permanent);
-        if let Some(delay) = options.delayed_time {
-            let future = self.compute_delayed_time(delay)?;
-            self.write_register(Register::DxTime, NO_SUBADDRESS, &future.to_bytes())?;
+        if let Some(scheduled) = options.delayed_time {
+            self.write_register(
+                Register::DxTime,
+                NO_SUBADDRESS,
+                &scheduled.dx_time().to_bytes(),
+            )?;
         }
         compose_receive_sys_ctrl(
             &mut self.sys_ctrl,
@@ -147,6 +140,22 @@ where
         );
         let sys_ctrl = self.sys_ctrl;
         self.write_register(Register::SysCtrl, NO_SUBADDRESS, &sys_ctrl)?;
+
+        if options.delayed_time.is_some() {
+            // If the programmed time already passed the receiver would stall
+            // until timer wrap; fall back to an immediate receive instead.
+            let mut status_hi = [0u8; 1];
+            self.read_register(Register::SysStatus, SYS_STATUS_HI_SUB, &mut status_hi)?;
+            if status_hi[0] & HPDWARN_HI_BIT != 0 {
+                self.idle()?;
+                self.sys_ctrl = [0; LEN_SYS_CTRL];
+                self.runtime.begin_receive_session(options.permanent);
+                compose_receive_sys_ctrl(&mut self.sys_ctrl, self.runtime.frame_check, false);
+                let sys_ctrl = self.sys_ctrl;
+                self.write_register(Register::SysCtrl, NO_SUBADDRESS, &sys_ctrl)?;
+                return Err(Error::DelayedReceiveTooLate);
+            }
+        }
         Ok(())
     }
 
@@ -172,9 +181,12 @@ where
 
         self.sys_ctrl = [0; LEN_SYS_CTRL];
         self.runtime.begin_transmit_session();
-        if let Some(delay) = options.delayed_time {
-            let future = self.compute_delayed_time(delay)?;
-            self.write_register(Register::DxTime, NO_SUBADDRESS, &future.to_bytes())?;
+        if let Some(scheduled) = options.delayed_time {
+            self.write_register(
+                Register::DxTime,
+                NO_SUBADDRESS,
+                &scheduled.dx_time().to_bytes(),
+            )?;
         }
         compose_transmit_sys_ctrl(
             &mut self.sys_ctrl,
@@ -184,17 +196,41 @@ where
         );
         let sys_ctrl = self.sys_ctrl;
         self.write_register(Register::SysCtrl, NO_SUBADDRESS, &sys_ctrl)?;
+
+        if options.delayed_time.is_some() {
+            // HPDWARN/TXPUTE means the delayed send was scheduled too late;
+            // abort instead of stalling until timer wrap (~17 s).
+            let mut status_hi = [0u8; 2];
+            self.read_register(Register::SysStatus, SYS_STATUS_HI_SUB, &mut status_hi)?;
+            if u16::from_le_bytes(status_hi) & DELAYED_TX_LATE_MASK != 0 {
+                self.idle()?;
+                // Do not leave the node deaf: restore the permanent receive
+                // session the aborted transmission interrupted.
+                if self.runtime.permanent_receive {
+                    self.start_receive(RxOptions {
+                        delayed_time: None,
+                        permanent: true,
+                    })?;
+                }
+                return Err(Error::DelayedSendTooLate);
+            }
+        }
         self.runtime.complete_transmit_session();
         Ok(())
     }
 
-    /// Computes the delayed absolute transmit or receive timestamp used by the DW1000.
-    pub fn compute_delayed_time(
+    /// Schedules a delayed TX/RX activation `delay` from the current system
+    /// time.
+    ///
+    /// The returned value carries both the `DX_TIME` register value and the
+    /// exact transmit timestamp the chip will report, so ranging payloads can
+    /// embed the timestamp before the frame is sent.
+    pub fn schedule_delayed(
         &mut self,
         delay: DwTime,
-    ) -> Result<DwTime, Error<SPI::Error, PinE>> {
-        let now = self.read_system_timestamp()? + delay;
-        Ok(self.runtime.compute_delayed_time(now))
+    ) -> Result<DelayedTime, Error<SPI::Error, PinE>> {
+        let now = self.read_system_timestamp()?;
+        Ok(self.runtime.schedule_delayed(now, delay))
     }
 
     /// Reads a received frame into `buffer`.
@@ -203,11 +239,19 @@ where
         buffer: &'a mut [u8],
     ) -> Result<RxFrame<'a>, Error<SPI::Error, PinE>> {
         let status = self.read_sys_status()?;
-        self.runtime
-            .validate_rx_status(status)
-            .map_err(Error::Receive)?;
+        if let Err(rx_error) = self.runtime.validate_rx_status(status) {
+            if rx_error != RxError::FrameNotReady {
+                // Errata: the receiver must be reset after any RX error or
+                // timeout, or the next frame's timestamp may be wrong.
+                self.reset_receiver()?;
+            }
+            return Err(Error::Receive(rx_error));
+        }
 
-        let needed = self.read_received_length()?;
+        let phy = self.runtime.phy.ok_or(Error::NotConfigured)?;
+        let mut rx_finfo = [0u8; LEN_RX_FINFO];
+        self.read_register(Register::RxFinfo, NO_SUBADDRESS, &mut rx_finfo)?;
+        let needed = self.runtime.rx_payload_len(rx_finfo);
         if buffer.len() < needed {
             return Err(Error::BufferTooSmall {
                 len: buffer.len(),
@@ -215,11 +259,17 @@ where
             });
         }
         self.read_register(Register::RxBuffer, NO_SUBADDRESS, &mut buffer[..needed])?;
-        let timestamp = self.read_receive_timestamp()?;
-        let metrics = self.read_signal_metrics()?;
+        let mut rx_time = [0u8; LEN_RX_TIME];
+        self.read_register(Register::RxTime, RX_STAMP_SUB, &mut rx_time)?;
+        let mut rx_fqual = [0u8; LEN_RX_FQUAL];
+        self.read_register(Register::RxFqual, NO_SUBADDRESS, &mut rx_fqual)?;
+
+        let (timestamp, metrics) = parse_rx_snapshot(phy, &rx_finfo, &rx_time, &rx_fqual);
         Ok(RxFrame {
             bytes: &buffer[..needed],
-            timestamp: self.correct_receive_timestamp(timestamp, metrics.receive_power_dbm),
+            timestamp: self
+                .runtime
+                .correct_receive_timestamp(timestamp, metrics.receive_power_dbm),
             metrics,
             status,
         })
@@ -236,11 +286,15 @@ where
 
     /// Reads the current receive metrics.
     pub fn read_signal_metrics(&mut self) -> Result<SignalMetrics, Error<SPI::Error, PinE>> {
-        Ok(SignalMetrics {
-            receive_power_dbm: self.read_receive_power()?,
-            first_path_power_dbm: self.read_first_path_power()?,
-            quality: self.read_receive_quality()?,
-        })
+        let phy = self.runtime.phy.ok_or(Error::NotConfigured)?;
+        let mut rx_finfo = [0u8; LEN_RX_FINFO];
+        self.read_register(Register::RxFinfo, NO_SUBADDRESS, &mut rx_finfo)?;
+        let mut rx_time = [0u8; LEN_RX_TIME];
+        self.read_register(Register::RxTime, RX_STAMP_SUB, &mut rx_time)?;
+        let mut rx_fqual = [0u8; LEN_RX_FQUAL];
+        self.read_register(Register::RxFqual, NO_SUBADDRESS, &mut rx_fqual)?;
+        let (_, metrics) = parse_rx_snapshot(phy, &rx_finfo, &rx_time, &rx_fqual);
+        Ok(metrics)
     }
 
     /// Reads `SYS_STATUS`.
@@ -252,13 +306,24 @@ where
 
     /// Clears the selected `SYS_STATUS` bits and re-arms permanent receive after RX/TX completion.
     pub fn clear_events(&mut self, event_mask: SysStatus) -> Result<(), Error<SPI::Error, PinE>> {
+        let should_rearm_after_good_receive =
+            self.runtime.should_rearm_after_good_receive(event_mask);
+        // Restarting the receiver issues TRXOFF, which would cancel a delayed
+        // transmission scheduled after `event_mask` was read. Only restart
+        // when the chip still reports a completed transmission; a pending
+        // delayed TX re-arms the receiver from its own TX-done event instead.
+        let mut should_restart_receive = self.runtime.should_restart_receive(event_mask);
+        if should_restart_receive {
+            let mut status_low = [0u8; 1];
+            self.read_register(Register::SysStatus, NO_SUBADDRESS, &mut status_low)?;
+            should_restart_receive = status_low[0] & TXFRS_LOW_BIT != 0;
+        }
         self.write_register(
             Register::SysStatus,
             NO_SUBADDRESS,
             &sys_status_to_bytes(event_mask),
         )?;
-        let should_restart_receive = self.runtime.should_restart_receive(event_mask);
-        if should_restart_receive {
+        if should_restart_receive || should_rearm_after_good_receive {
             self.start_receive(RxOptions {
                 delayed_time: None,
                 permanent: true,
@@ -291,9 +356,9 @@ where
         self.write_register(Register::Pmsc, PMSC_LEDC_SUB, &pmsc_ledc)?;
 
         let mut gpio_mode = [0u8; LEN_GPIO_MODE];
-        self.read_register(Register::GpioCtrl, GPIO_MODE_SUB as u16, &mut gpio_mode)?;
+        self.read_register(Register::GpioCtrl, GPIO_MODE_SUB, &mut gpio_mode)?;
         compose_gpio_led_mode(&mut gpio_mode);
-        self.write_register(Register::GpioCtrl, GPIO_MODE_SUB as u16, &gpio_mode)?;
+        self.write_register(Register::GpioCtrl, GPIO_MODE_SUB, &gpio_mode)?;
         Ok(())
     }
 
@@ -305,97 +370,38 @@ where
         Ok(())
     }
 
-    fn apply_phy_config(&mut self, phy: ValidatedPhyConfig) -> Result<(), Error<SPI::Error, PinE>> {
-        let sfd_len = compose_phy_register_fields(
-            &mut self.sys_cfg,
-            &mut self.tx_fctrl,
-            &mut self.chan_ctrl,
-            phy,
-        );
-        self.write_register(Register::UsrSfd, SFD_LENGTH_SUB, &[sfd_len])?;
+    fn verify_device_id(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
+        let mut bytes = [0u8; LEN_DEV_ID];
+        self.read_register(Register::DevId, NO_SUBADDRESS, &mut bytes)?;
+        let device_id = u32::from_le_bytes(bytes);
+        if device_id != EXPECTED_DEVICE_ID {
+            return Err(Error::InvalidDeviceId(device_id));
+        }
         Ok(())
     }
 
-    fn apply_tuning(&mut self, phy: ValidatedPhyConfig) -> Result<(), Error<SPI::Error, PinE>> {
-        let tuning = select_tuning_values(phy).map_err(Error::InvalidConfig)?;
+    /// Loads the factory-calibrated LDO tune value from OTP, if programmed.
+    fn kick_ldo_tune(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
+        let ldo_tune = self.read_otp(OTP_ADDRESS_LDOTUNE)?;
+        if ldo_tune[0] != 0 {
+            self.write_register(Register::OtpIf, OTP_SF_SUB, &[OTP_SF_LDO_KICK])?;
+        }
+        Ok(())
+    }
 
-        self.write_register(
-            Register::AgcTune,
-            AGC_TUNE1_SUB,
-            &tuning.agc_tune1.to_le_bytes(),
-        )?;
-        self.write_register(
-            Register::AgcTune,
-            AGC_TUNE2_SUB,
-            &0x2502_A907u32.to_le_bytes(),
-        )?;
-        self.write_register(Register::AgcTune, AGC_TUNE3_SUB, &0x0035u16.to_le_bytes())?;
-
-        self.write_register(
-            Register::DrxTune,
-            DRX_TUNE0B_SUB,
-            &tuning.drx_tune0b.to_le_bytes(),
-        )?;
-        self.write_register(
-            Register::DrxTune,
-            DRX_TUNE1A_SUB,
-            &tuning.drx_tune1a.to_le_bytes(),
-        )?;
-        self.write_register(
-            Register::DrxTune,
-            DRX_TUNE1B_SUB,
-            &tuning.drx_tune1b.to_le_bytes(),
-        )?;
-        self.write_register(
-            Register::DrxTune,
-            DRX_TUNE2_SUB,
-            &tuning.drx_tune2.to_le_bytes(),
-        )?;
-        self.write_register(
-            Register::DrxTune,
-            DRX_TUNE4H_SUB,
-            &tuning.drx_tune4h.to_le_bytes(),
-        )?;
-
-        self.write_register(Register::RfConf, RF_RXCTRLH_SUB, &[tuning.rf_rxctrlh])?;
-        self.write_register(
-            Register::RfConf,
-            RF_TXCTRL_SUB,
-            &tuning.rf_txctrl.to_le_bytes(),
-        )?;
-        self.write_register(Register::TxCal, TC_PGDELAY_SUB, &[tuning.tc_pgdelay])?;
-
-        self.write_register(
-            Register::FsCtrl,
-            FS_PLLCFG_SUB,
-            &tuning.fspllcfg.to_le_bytes(),
-        )?;
-        self.write_register(Register::FsCtrl, FS_PLLTUNE_SUB, &[tuning.fsplltune])?;
-
-        self.write_register(Register::LdeIf, LDE_CFG1_SUB, &[0x0D])?;
-        self.write_register(
-            Register::LdeIf,
-            LDE_CFG2_SUB,
-            &tuning.lde_cfg2.to_le_bytes(),
-        )?;
-        self.write_register(
-            Register::LdeIf,
-            LDE_REPC_SUB,
-            &tuning.lde_repc.to_le_bytes(),
-        )?;
-        self.write_register(
-            Register::TxPower,
-            NO_SUBADDRESS,
-            &tuning.tx_power.to_le_bytes(),
-        )?;
-
-        let xtal_trim = self.read_otp(0x01E)?[0];
-        let fs_xtalt = if xtal_trim == 0 {
-            0x70
-        } else {
-            (xtal_trim & 0x1F) | 0x60
-        };
-        self.write_register(Register::FsCtrl, FS_XTALT_SUB, &[fs_xtalt])?;
+    /// Resets the receiver after an RX error or timeout (official errata) and
+    /// re-arms it when a permanent receive session is active.
+    fn reset_receiver(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
+        self.idle()?;
+        self.clear_receive_status()?;
+        self.write_register(Register::Pmsc, PMSC_SOFTRESET_SUB, &[PMSC_SOFTRESET_RX])?;
+        self.write_register(Register::Pmsc, PMSC_SOFTRESET_SUB, &[PMSC_SOFTRESET_CLEAR])?;
+        if self.runtime.permanent_receive {
+            self.start_receive(RxOptions {
+                delayed_time: None,
+                permanent: true,
+            })?;
+        }
         Ok(())
     }
 
@@ -424,11 +430,11 @@ where
         let mut address_bytes = [0u8; LEN_OTP_ADDR];
         address_bytes.copy_from_slice(&address.to_le_bytes());
         self.write_register(Register::OtpIf, OTP_ADDR_SUB, &address_bytes)?;
-        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &[0x03])?;
-        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &[0x01])?;
+        // OTPRDEN | OTPREAD, then clear; OTPREAD self-latches the data.
+        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &[0x03, 0x00])?;
+        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &[0x00, 0x00])?;
         let mut data = [0u8; LEN_OTP_RDAT];
         self.read_register(Register::OtpIf, OTP_RDAT_SUB, &mut data)?;
-        self.write_register(Register::OtpIf, OTP_CTRL_SUB, &[0x00])?;
         Ok(data)
     }
 
@@ -440,23 +446,24 @@ where
     }
 
     fn clear_interrupts(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
-        self.sys_mask = cleared_interrupt_mask();
-        let sys_mask = self.sys_mask;
+        let sys_mask = cleared_interrupt_mask();
         self.write_register(Register::SysMask, NO_SUBADDRESS, &sys_mask)
     }
 
     fn clear_receive_status(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
-        self.clear_events(receive_status_clear_mask())
+        self.write_register(
+            Register::SysStatus,
+            NO_SUBADDRESS,
+            &sys_status_to_bytes(receive_status_clear_mask()),
+        )
     }
 
     fn clear_transmit_status(&mut self) -> Result<(), Error<SPI::Error, PinE>> {
-        self.clear_events(transmit_status_clear_mask())
-    }
-
-    fn read_received_length(&mut self) -> Result<usize, Error<SPI::Error, PinE>> {
-        let mut info = [0u8; LEN_RX_FINFO];
-        self.read_register(Register::RxFinfo, NO_SUBADDRESS, &mut info)?;
-        Ok(self.runtime.rx_payload_len(info))
+        self.write_register(
+            Register::SysStatus,
+            NO_SUBADDRESS,
+            &sys_status_to_bytes(transmit_status_clear_mask()),
+        )
     }
 
     fn read_transmit_timestamp(&mut self) -> Result<DwTime, Error<SPI::Error, PinE>> {
@@ -475,54 +482,6 @@ where
         let mut bytes = [0u8; LEN_RX_STAMP];
         self.read_register(Register::SysTime, NO_SUBADDRESS, &mut bytes)?;
         Ok(DwTime::from_bytes(&bytes))
-    }
-
-    fn read_receive_quality(&mut self) -> Result<f32, Error<SPI::Error, PinE>> {
-        let mut noise = [0u8; LEN_STD_NOISE];
-        let mut fp2 = [0u8; LEN_FP_AMPL2];
-        self.read_register(Register::RxFqual, STD_NOISE_SUB, &mut noise)?;
-        self.read_register(Register::RxFqual, FP_AMPL2_SUB, &mut fp2)?;
-        Ok(compute_receive_quality(
-            u16::from_le_bytes(noise),
-            u16::from_le_bytes(fp2),
-        ))
-    }
-
-    fn read_first_path_power(&mut self) -> Result<f32, Error<SPI::Error, PinE>> {
-        let phy = self.runtime.phy.ok_or(Error::NotConfigured)?;
-        let mut fp1 = [0u8; LEN_FP_AMPL1];
-        let mut fp2 = [0u8; LEN_FP_AMPL2];
-        let mut fp3 = [0u8; LEN_FP_AMPL3];
-        let mut info = [0u8; LEN_RX_FINFO];
-        self.read_register(Register::RxTime, FP_AMPL1_SUB, &mut fp1)?;
-        self.read_register(Register::RxFqual, FP_AMPL2_SUB, &mut fp2)?;
-        self.read_register(Register::RxFqual, FP_AMPL3_SUB, &mut fp3)?;
-        self.read_register(Register::RxFinfo, NO_SUBADDRESS, &mut info)?;
-        Ok(compute_first_path_power(
-            phy,
-            u16::from_le_bytes(fp1),
-            u16::from_le_bytes(fp2),
-            u16::from_le_bytes(fp3),
-            extract_preamble_acc_count(info),
-        ))
-    }
-
-    fn read_receive_power(&mut self) -> Result<f32, Error<SPI::Error, PinE>> {
-        let phy = self.runtime.phy.ok_or(Error::NotConfigured)?;
-        let mut cir = [0u8; LEN_CIR_PWR];
-        let mut info = [0u8; LEN_RX_FINFO];
-        self.read_register(Register::RxFqual, CIR_PWR_SUB, &mut cir)?;
-        self.read_register(Register::RxFinfo, NO_SUBADDRESS, &mut info)?;
-        Ok(compute_receive_power(
-            phy,
-            u16::from_le_bytes(cir),
-            extract_preamble_acc_count(info),
-        ))
-    }
-
-    fn correct_receive_timestamp(&self, timestamp: DwTime, receive_power_dbm: f32) -> DwTime {
-        self.runtime
-            .correct_receive_timestamp(timestamp, receive_power_dbm)
     }
 
     fn read_register(

@@ -201,7 +201,7 @@ fn async_reconfigure_programs_identity_registers() {
 }
 
 #[test]
-fn async_compute_delayed_time_aligns_timestamp_and_applies_antenna_delay() {
+fn async_schedule_delayed_aligns_timestamp_and_predicts_tx() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let spi = RecordingAsyncSpi::new(
         log,
@@ -210,19 +210,31 @@ fn async_compute_delayed_time_aligns_timestamp_and_applies_antenna_delay() {
     let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
 
     let delay = DwTime::from_micros(7000.0);
-    let computed = block_on(driver.compute_delayed_time(delay)).unwrap();
+    let scheduled = block_on(driver.schedule_delayed(delay)).unwrap();
 
     let mut expected = DwTime::from_bytes(&[0x34, 0x12, 0x00, 0x00, 0x00]) + delay;
     let mut bytes = expected.to_bytes();
     bytes[0] = 0;
     bytes[1] &= 0xFE;
-    expected = DwTime::from_bytes(&bytes) + DwTime::from_ticks(16_456);
-    assert_eq!(computed, expected);
+    expected = DwTime::from_bytes(&bytes);
+    assert_eq!(scheduled.dx_time(), expected);
+    assert_eq!(
+        scheduled.predicted_tx_timestamp(),
+        expected + DwTime::from_ticks(16_456)
+    );
 }
 
 #[test]
 fn async_read_frame_reads_payload_and_metrics() {
     let log = Arc::new(Mutex::new(Vec::new()));
+    let mut rx_time = vec![0u8; 14];
+    rx_time[0] = 0x10; // RX_STAMP low byte
+    rx_time[7] = 0x02; // FP_AMPL1
+    let mut rx_fqual = vec![0u8; 8];
+    rx_fqual[0] = 0x20; // STD_NOISE
+    rx_fqual[2] = 0x03; // FP_AMPL2
+    rx_fqual[4] = 0x04; // FP_AMPL3
+    rx_fqual[6] = 0x40; // CIR_PWR
     let reads = VecDeque::from(vec![
         vec![0; 4],
         dw1000_rs::registers::sys_status_to_bytes(SysStatus(
@@ -232,15 +244,8 @@ fn async_read_frame_reads_payload_and_metrics() {
         .to_vec(),
         vec![0x07, 0x00, 0x00, 0x00],
         vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
-        vec![0x10, 0x00, 0x00, 0x00, 0x00],
-        vec![0x20, 0x00],
-        vec![0x40, 0x00, 0x00, 0x00],
-        vec![0x02, 0x00],
-        vec![0x03, 0x00],
-        vec![0x04, 0x00],
-        vec![0x40, 0x00, 0x00, 0x00],
-        vec![0x02, 0x00],
-        vec![0x03, 0x00],
+        rx_time,
+        rx_fqual,
     ]);
     let spi = RecordingAsyncSpi::new(log, reads);
     let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
@@ -284,7 +289,11 @@ fn async_read_signal_metrics_before_config_returns_not_configured() {
 #[test]
 fn async_clear_tx_sent_restarts_receive_when_permanent_mode_is_enabled() {
     let log = Arc::new(Mutex::new(Vec::new()));
-    let spi = RecordingAsyncSpi::new(log.clone(), VecDeque::new());
+    // The live SYS_STATUS check must still report the completed transmission.
+    let reads = VecDeque::from(vec![vec![
+        (dw1000_rs::registers::status::TX_FRAME_SENT.0 & 0xFF) as u8,
+    ]]);
+    let spi = RecordingAsyncSpi::new(log.clone(), reads);
     let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
 
     block_on(driver.start_receive(RxOptions {
@@ -304,7 +313,7 @@ fn async_clear_tx_sent_restarts_receive_when_permanent_mode_is_enabled() {
 }
 
 #[test]
-fn async_clear_rx_ready_restarts_receive_when_permanent_mode_is_enabled() {
+fn async_clear_good_receive_restarts_single_buffered_permanent_receive() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let spi = RecordingAsyncSpi::new(log.clone(), VecDeque::new());
     let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
@@ -314,7 +323,10 @@ fn async_clear_rx_ready_restarts_receive_when_permanent_mode_is_enabled() {
         permanent: true,
     }))
     .unwrap();
-    block_on(driver.clear_events(dw1000_rs::registers::status::RX_FRAME_READY)).unwrap();
+    block_on(driver.clear_events(
+        dw1000_rs::registers::status::RX_FRAME_READY | dw1000_rs::registers::status::RX_FRAME_GOOD,
+    ))
+    .unwrap();
 
     let transactions = log.lock().unwrap();
     let restart_count = transactions
@@ -322,4 +334,62 @@ fn async_clear_rx_ready_restarts_receive_when_permanent_mode_is_enabled() {
         .filter(|transaction| transaction.writes == vec![vec![0x8D], vec![0x00, 0x01, 0x00, 0x00]])
         .count();
     assert_eq!(restart_count, 2);
+}
+
+#[test]
+fn async_clearing_good_receive_does_not_cancel_pending_delayed_transmission() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let spi = RecordingAsyncSpi::new(log.clone(), VecDeque::new());
+    let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
+
+    block_on(driver.start_receive(RxOptions {
+        delayed_time: None,
+        permanent: true,
+    }))
+    .unwrap();
+    let scheduled = block_on(driver.schedule_delayed(DwTime::from_micros(7000.0))).unwrap();
+    block_on(driver.transmit(
+        &[0xAA, 0xBB, 0xCC],
+        TxOptions {
+            delayed_time: Some(scheduled),
+            wait_for_response: false,
+        },
+    ))
+    .unwrap();
+    block_on(driver.clear_events(
+        dw1000_rs::registers::status::RX_FRAME_READY | dw1000_rs::registers::status::RX_FRAME_GOOD,
+    ))
+    .unwrap();
+
+    let transactions = log.lock().unwrap();
+    let restart_count = transactions
+        .iter()
+        .filter(|transaction| transaction.writes == vec![vec![0x8D], vec![0x00, 0x01, 0x00, 0x00]])
+        .count();
+    assert_eq!(restart_count, 1);
+}
+
+#[test]
+fn async_clear_stale_tx_sent_does_not_cancel_a_pending_delayed_transmission() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    // TXFRS reads back clear: the mask carries a stale bit while a new
+    // delayed transmission is still pending, so the receiver must not be
+    // restarted (TRXOFF would cancel the pending send).
+    let spi = RecordingAsyncSpi::new(log.clone(), VecDeque::new());
+    let mut driver = AsyncDw1000::new(spi, MockInputPin, MockOutputPin);
+
+    block_on(driver.start_receive(RxOptions {
+        delayed_time: None,
+        permanent: true,
+    }))
+    .unwrap();
+    block_on(driver.transmit(&[0xAA, 0xBB, 0xCC], TxOptions::default())).unwrap();
+    block_on(driver.clear_events(dw1000_rs::registers::status::TX_FRAME_SENT)).unwrap();
+
+    let transactions = log.lock().unwrap();
+    let restart_count = transactions
+        .iter()
+        .filter(|transaction| transaction.writes == vec![vec![0x8D], vec![0x00, 0x01, 0x00, 0x00]])
+        .count();
+    assert_eq!(restart_count, 1);
 }

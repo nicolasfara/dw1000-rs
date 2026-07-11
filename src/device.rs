@@ -169,6 +169,11 @@ impl SysStatus {
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
     }
+
+    /// Returns `true` when at least one bit in `other` is set in `self`.
+    pub const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
 }
 
 impl BitOr for SysStatus {
@@ -213,6 +218,12 @@ pub struct Peer {
     pub last_sequence: Option<u8>,
     /// Reply delay selected for this peer.
     pub reply_delay_us: u32,
+    /// Anchor-side flag: a poll from this peer was acknowledged and the
+    /// matching range frame has not arrived yet.
+    pub awaiting_range: bool,
+    /// Host timestamp of the poll behind `awaiting_range`, used to expire
+    /// stale exchanges instead of mixing timestamps across exchanges.
+    pub poll_received_ms: u32,
     /// Ranging timestamps.
     pub poll_sent: DwTime,
     /// Ranging timestamps.
@@ -240,6 +251,8 @@ impl Peer {
             last_activity_ms: 0,
             last_sequence: None,
             reply_delay_us: 0,
+            awaiting_range: false,
+            poll_received_ms: 0,
             poll_sent: DwTime::zero(),
             poll_received: DwTime::zero(),
             poll_ack_sent: DwTime::zero(),
