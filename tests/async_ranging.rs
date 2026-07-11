@@ -214,8 +214,7 @@ fn async_tag_waits_for_every_range_report_before_starting_the_next_poll() {
         for anchor in [anchor_a, anchor_b] {
             let mut init = [0u8; 127];
             let init_len =
-                encode_ranging_init(0, anchor.short_address, tag_identity.eui, &mut init)
-                    .unwrap();
+                encode_ranging_init(0, anchor.short_address, tag_identity.eui, &mut init).unwrap();
             radio.push_rx(&init[..init_len], DwTime::from_ticks(20), metrics());
             tag.on_rx_async(&mut radio, 81, &mut [0u8; 127])
                 .await
@@ -239,7 +238,11 @@ fn async_tag_waits_for_every_range_report_before_starting_the_next_poll() {
                 &mut poll_ack,
             )
             .unwrap();
-            radio.push_rx(&poll_ack[..poll_ack_len], DwTime::from_ticks(200), metrics());
+            radio.push_rx(
+                &poll_ack[..poll_ack_len],
+                DwTime::from_ticks(200),
+                metrics(),
+            );
             tag.on_rx_async(&mut radio, 161, &mut [0u8; 127])
                 .await
                 .unwrap();
@@ -302,9 +305,13 @@ fn async_tag_resets_after_exchange_timeout_and_polls_again() {
         tag.tick_async(&mut radio, 80).await.unwrap();
 
         let mut init = [0u8; 127];
-        let init_len =
-            encode_ranging_init(0, anchor_identity.short_address, tag_identity.eui, &mut init)
-                .unwrap();
+        let init_len = encode_ranging_init(
+            0,
+            anchor_identity.short_address,
+            tag_identity.eui,
+            &mut init,
+        )
+        .unwrap();
         radio.push_rx(&init[..init_len], DwTime::from_ticks(20), metrics());
         tag.on_rx_async(&mut radio, 81, &mut [0u8; 127])
             .await
@@ -347,7 +354,10 @@ fn async_coordinator_broadcasts_schedule_sync_without_changing_anchor_peers() {
             .start_async(&mut secondary_radio, 0)
             .await
             .unwrap();
-        coordinator.tick_async(&mut coordinator_radio, 80).await.unwrap();
+        coordinator
+            .tick_async(&mut coordinator_radio, 80)
+            .await
+            .unwrap();
 
         assert_eq!(
             detect_frame_kind(coordinator_radio.last_tx()).unwrap(),
@@ -388,8 +398,7 @@ fn async_tag_ranges_with_acknowledged_anchors_when_another_anchor_misses_its_rep
         for anchor in [anchor_a, anchor_b] {
             let mut init = [0u8; 127];
             let init_len =
-                encode_ranging_init(0, anchor.short_address, tag_identity.eui, &mut init)
-                    .unwrap();
+                encode_ranging_init(0, anchor.short_address, tag_identity.eui, &mut init).unwrap();
             radio.push_rx(&init[..init_len], DwTime::from_ticks(20), metrics());
             tag.on_rx_async(&mut radio, 81, &mut [0u8; 127])
                 .await
@@ -405,7 +414,11 @@ fn async_tag_ranges_with_acknowledged_anchors_when_another_anchor_misses_its_rep
             &mut poll_ack,
         )
         .unwrap();
-        radio.push_rx(&poll_ack[..poll_ack_len], DwTime::from_ticks(200), metrics());
+        radio.push_rx(
+            &poll_ack[..poll_ack_len],
+            DwTime::from_ticks(200),
+            metrics(),
+        );
         tag.on_rx_async(&mut radio, 180, &mut [0u8; 127])
             .await
             .unwrap();
@@ -808,13 +821,9 @@ fn async_anchors_stagger_ranging_init_after_blink() {
     block_on(async {
         let tag_identity = identity(0x1234, [1, 2, 3, 4, 5, 6, 7, 8]);
         let mut blink = [0u8; 127];
-        let blink_len = encode_discovery_blink(
-            0,
-            tag_identity.eui,
-            tag_identity.short_address,
-            &mut blink,
-        )
-        .unwrap();
+        let blink_len =
+            encode_discovery_blink(0, tag_identity.eui, tag_identity.short_address, &mut blink)
+                .unwrap();
 
         for (anchor_identity, reply_delay_us) in [
             (identity(0x4321, [9, 10, 11, 12, 13, 14, 15, 16]), 7_000),

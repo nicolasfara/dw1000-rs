@@ -211,10 +211,18 @@ fn tag_waits_for_every_range_report_before_starting_the_next_poll() {
 
     for anchor in [anchor_a, anchor_b] {
         let mut poll_ack = [0u8; 127];
-        let poll_ack_len =
-            encode_poll_ack(1, anchor.short_address, tag_identity.short_address, &mut poll_ack)
-                .unwrap();
-        radio.push_rx(&poll_ack[..poll_ack_len], DwTime::from_ticks(200), metrics());
+        let poll_ack_len = encode_poll_ack(
+            1,
+            anchor.short_address,
+            tag_identity.short_address,
+            &mut poll_ack,
+        )
+        .unwrap();
+        radio.push_rx(
+            &poll_ack[..poll_ack_len],
+            DwTime::from_ticks(200),
+            metrics(),
+        );
         tag.on_rx(&mut radio, 161, &mut [0u8; 127]).unwrap();
     }
     radio.next_timestamps.push_back(Timestamps {
@@ -272,9 +280,13 @@ fn tag_resets_after_exchange_timeout_and_polls_again() {
     tag.tick(&mut radio, 80).unwrap();
 
     let mut init = [0u8; 127];
-    let init_len =
-        encode_ranging_init(0, anchor_identity.short_address, tag_identity.eui, &mut init)
-            .unwrap();
+    let init_len = encode_ranging_init(
+        0,
+        anchor_identity.short_address,
+        tag_identity.eui,
+        &mut init,
+    )
+    .unwrap();
     radio.push_rx(&init[..init_len], DwTime::from_ticks(20), metrics());
     tag.on_rx(&mut radio, 81, &mut [0u8; 127]).unwrap();
 
@@ -358,7 +370,11 @@ fn tag_ranges_with_acknowledged_anchors_when_another_anchor_misses_its_reply() {
         &mut poll_ack,
     )
     .unwrap();
-    radio.push_rx(&poll_ack[..poll_ack_len], DwTime::from_ticks(200), metrics());
+    radio.push_rx(
+        &poll_ack[..poll_ack_len],
+        DwTime::from_ticks(200),
+        metrics(),
+    );
     tag.on_rx(&mut radio, 180, &mut [0u8; 127]).unwrap();
 
     radio.delayed_times.push_back(DwTime::from_ticks(260));
@@ -429,13 +445,9 @@ fn tick_prunes_inactive_peers() {
 fn anchors_stagger_ranging_init_after_blink() {
     let tag_identity = identity(0x1234, [1, 2, 3, 4, 5, 6, 7, 8]);
     let mut blink = [0u8; 127];
-    let blink_len = encode_discovery_blink(
-        0,
-        tag_identity.eui,
-        tag_identity.short_address,
-        &mut blink,
-    )
-    .unwrap();
+    let blink_len =
+        encode_discovery_blink(0, tag_identity.eui, tag_identity.short_address, &mut blink)
+            .unwrap();
 
     for (anchor_identity, reply_delay_us) in [
         (identity(0x4321, [9, 10, 11, 12, 13, 14, 15, 16]), 7_000),
@@ -744,13 +756,9 @@ fn anchor_accepts_a_new_poll_after_missing_the_range_frame() {
 
     anchor.start(&mut radio, 0).unwrap();
     let mut blink = [0u8; 127];
-    let blink_len = encode_discovery_blink(
-        0,
-        tag_identity.eui,
-        tag_identity.short_address,
-        &mut blink,
-    )
-    .unwrap();
+    let blink_len =
+        encode_discovery_blink(0, tag_identity.eui, tag_identity.short_address, &mut blink)
+            .unwrap();
     radio.push_rx(&blink[..blink_len], DwTime::from_ticks(10), metrics());
     anchor.on_rx(&mut radio, 1, &mut [0u8; 127]).unwrap();
 
@@ -1261,7 +1269,10 @@ fn tag_shares_the_frame_only_in_its_slot_after_schedule_sync() {
     // At the start of its slot the tag transmits (discovery blink).
     tag.tick(&mut radio, 400).unwrap();
     assert_eq!(radio.transmitted.len(), 1);
-    assert_eq!(detect_frame_kind(radio.last_tx()).unwrap(), FrameKind::Blink);
+    assert_eq!(
+        detect_frame_kind(radio.last_tx()).unwrap(),
+        FrameKind::Blink
+    );
 
     // The other tag's slot stays untouched.
     tag.tick(&mut radio, 500).unwrap();

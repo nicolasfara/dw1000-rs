@@ -679,16 +679,16 @@ impl<const N: usize> RangingNode<N> {
             if self.config.anchor_is_coordinator {
                 let since_sync_ms = now_ms.wrapping_sub(self.last_schedule_sync_ms);
                 if since_sync_ms >= self.config.schedule.range_period_ms {
-                    let overdue = since_sync_ms
-                        >= self.config.schedule.range_period_ms.saturating_mul(4);
+                    let overdue =
+                        since_sync_ms >= self.config.schedule.range_period_ms.saturating_mul(4);
                     let freshness_bound_ms =
                         self.config.schedule.session_timeout_ms.saturating_mul(2);
                     let exchange_active = self.peers.iter().any(|peer| {
                         peer.awaiting_range
                             && now_ms.wrapping_sub(peer.poll_received_ms) <= freshness_bound_ms
                     });
-                    let quiet = now_ms.wrapping_sub(self.last_activity_ms)
-                        >= self.config.timer_period_ms;
+                    let quiet =
+                        now_ms.wrapping_sub(self.last_activity_ms) >= self.config.timer_period_ms;
                     if overdue || (!exchange_active && quiet) {
                         self.last_schedule_sync_ms = now_ms;
                         return (None, TickAction::ScheduleSync);

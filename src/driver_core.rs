@@ -6,6 +6,7 @@ use crate::config::{
     ConfigError, DataRate, PacSize, PreambleCode, PreambleLength, PulseFrequency, RadioConfig,
     ValidatedPhyConfig,
 };
+use crate::device::SignalMetrics;
 use crate::device::{AntennaDelay, DeviceIdentity, SysStatus};
 use crate::error::RxError;
 use crate::registers::status;
@@ -24,7 +25,6 @@ use crate::registers::{
     LDE_CFG1_SUB, LDE_CFG2_SUB, LDE_REPC_SUB, LDE_RXANTD_SUB, RF_RXCTRLH_SUB, RF_TXCTRL_SUB,
     SFD_LENGTH_SUB, TC_PGDELAY_SUB,
 };
-use crate::device::SignalMetrics;
 use crate::time::{DelayedTime, DwTime, DISTANCE_PER_TICK_M};
 
 pub(crate) const LEN_UWB_FRAMES: usize = 127;
@@ -722,7 +722,11 @@ pub(crate) fn config_register_writes(
     [
         RegWrite::new(Register::UsrSfd, SFD_LENGTH_SUB, &[sfd_len]),
         RegWrite::new(Register::PanAdr, NO_SUBADDRESS, &panadr),
-        RegWrite::new(Register::Eui, NO_SUBADDRESS, &identity.eui.to_register_bytes()),
+        RegWrite::new(
+            Register::Eui,
+            NO_SUBADDRESS,
+            &identity.eui.to_register_bytes(),
+        ),
         RegWrite::new(Register::SysCfg, NO_SUBADDRESS, sys_cfg),
         RegWrite::new(Register::SysMask, NO_SUBADDRESS, sys_mask),
         RegWrite::new(Register::ChanCtrl, NO_SUBADDRESS, chan_ctrl),

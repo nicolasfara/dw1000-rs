@@ -427,10 +427,8 @@ fn delayed_transmit_programs_dx_time_without_antenna_delay() {
         .unwrap();
 
     let transactions = log.lock().unwrap();
-    assert!(transactions
-        .iter()
-        .any(|transaction| transaction.writes
-            == vec![vec![0x8A], scheduled.dx_time().to_bytes().to_vec()]));
+    assert!(transactions.iter().any(|transaction| transaction.writes
+        == vec![vec![0x8A], scheduled.dx_time().to_bytes().to_vec()]));
 }
 
 #[test]
@@ -454,10 +452,7 @@ fn reconfigure_programs_lde_cfg1_and_sfd_timeout() {
 #[test]
 fn init_rejects_wrong_device_id() {
     let log = Arc::new(Mutex::new(Vec::new()));
-    let spi = RecordingSpi::new(
-        log,
-        VecDeque::from(vec![vec![0x11, 0x22, 0x33, 0x44]]),
-    );
+    let spi = RecordingSpi::new(log, VecDeque::from(vec![vec![0x11, 0x22, 0x33, 0x44]]));
     let mut driver = Dw1000::new(spi, MockInputPin, MockOutputPin);
 
     let error = driver.init(&mut NoopDelay, &config()).unwrap_err();

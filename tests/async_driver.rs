@@ -324,8 +324,7 @@ fn async_clear_good_receive_restarts_single_buffered_permanent_receive() {
     }))
     .unwrap();
     block_on(driver.clear_events(
-        dw1000_rs::registers::status::RX_FRAME_READY
-            | dw1000_rs::registers::status::RX_FRAME_GOOD,
+        dw1000_rs::registers::status::RX_FRAME_READY | dw1000_rs::registers::status::RX_FRAME_GOOD,
     ))
     .unwrap();
 
@@ -358,8 +357,7 @@ fn async_clearing_good_receive_does_not_cancel_pending_delayed_transmission() {
     ))
     .unwrap();
     block_on(driver.clear_events(
-        dw1000_rs::registers::status::RX_FRAME_READY
-            | dw1000_rs::registers::status::RX_FRAME_GOOD,
+        dw1000_rs::registers::status::RX_FRAME_READY | dw1000_rs::registers::status::RX_FRAME_GOOD,
     ))
     .unwrap();
 
